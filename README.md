@@ -69,23 +69,64 @@ are computed and recorded (`ark-tbw payouts`) but no transaction is made.
 
 ## Run as a service
 
+ark-tbw always runs as your own user, never as root. There are two ways to install the service:
+a system service (the default) or a rootless user service.
+
+### System service (default)
+
 ```bash
 sudo ark-tbw service install    # writes /etc/systemd/system/ark-tbw.service, enabled at boot
 ark-tbw start
 ```
 
+sudo is only needed to write the unit file into `/etc/systemd/system` and to control the
+service: `ark-tbw start`, `stop`, `restart` and `reload` call `sudo systemctl` for you. The
+program itself runs as the user who ran `sudo` (or `--user NAME`), with extra systemd sandboxing
+(read-only system directories, private /tmp). Reading the log needs sudo unless your user is in
+the `adm` or `systemd-journal` group (`sudo usermod -aG adm $USER`, then log in again).
+
+### Rootless user service (no sudo)
+
+```bash
+ark-tbw service install --rootless    # writes ~/.config/systemd/user/ark-tbw.service
+ark-tbw start
+```
+
+The service belongs to your account's own systemd instance, so installing, start/stop/restart/
+reload and the log need no sudo at all. The commands are the same; ark-tbw sees which kind is
+installed.
+
+One thing needs an admin, once: **lingering**. Without it, a user service runs only while you
+are logged in, and does not start at boot. `service install --rootless` turns it on when it is
+allowed to, and otherwise tells you to run:
+
+```bash
+sudo loginctl enable-linger $USER
+```
+
+Run the install from a real login to the account (`ssh user@host`). After `su` or `sudo -u` it
+works once lingering is on; before that the user manager is not running and install says so.
+
+The user service has the same restart behaviour but leaves out the sandboxing options that need
+root to set up. Only one kind can be installed at a time: remove one
+(`ark-tbw service uninstall`, with sudo for the system service) before installing the other.
+
+### Commands
+
 | | |
 |---|---|
-| `ark-tbw start` / `stop` / `restart` | systemctl, with sudo when needed. A stop finishes the current step first |
+| `ark-tbw start` / `stop` / `restart` | through systemctl (with sudo for the system service). A stop finishes the current step first |
 | `ark-tbw reload` | re-read the config without a restart (SIGHUP) |
 | `ark-tbw logs` | last 100 log lines |
 | `ark-tbw logs -f` | follow the log |
 | `ark-tbw logs --since "1 hour ago"` | log since a time |
-| `sudo ark-tbw service uninstall` | remove the service (config and database stay) |
+| `ark-tbw service show [--rootless]` | print the unit file without installing it |
+| `ark-tbw service uninstall` | remove the service, with sudo for the system service (config and database stay) |
 
 The service restarts itself on failure. It stays stopped (exit code 2) on errors a restart cannot
 fix, such as a bad config or a chain reorganisation deeper than `network.confirmations`, so you
-can look first. `ark-tbw logs` reads journald, the same as `journalctl -u ark-tbw`.
+can look first. `ark-tbw logs` reads journald, the same as `journalctl -u ark-tbw` (rootless:
+`journalctl --user -u ark-tbw`).
 
 ## Day to day
 

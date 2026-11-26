@@ -86,7 +86,7 @@ enum Cmd {
         #[arg(long)]
         since: Option<String>,
     },
-    /// Install / remove the systemd service (needs sudo)
+    /// Install / remove the systemd service (sudo; or --rootless for a user service)
     Service {
         #[command(subcommand)]
         action: service::ServiceCmd,
