@@ -1,0 +1,33 @@
+[package]
+name = "ark-tbw"
+version = "0.1.0"
+description = "All-in-one true block weight reward sharing for ARK Core v3 validators"
+edition = "2021"
+license-file = "LICENSE"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+signal-hook = "0.3"
+libc = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+k256 = { version = "0.13", features = ["ecdsa", "arithmetic", "expose-field"] }
+sha2 = "0.10"
+ripemd = "0.1"
+bs58 = { version = "0.5", features = ["check"] }
+bip39 = "2"
+hex = "0.4"
+zeroize = "1"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+strip = true
+panic = "abort"

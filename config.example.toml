@@ -1,0 +1,76 @@
+# ark-tbw configuration. Copy to ~/.ark-tbw/config.toml and edit.
+# Every setting is checked at start-up; a bad value stops the service with a clear message.
+
+[network]
+# Your relay's API (fast, no rate limit), or a public one such as https://api.ark.io/api
+api = "http://127.0.0.1:4003/api"
+# Extra nodes that also receive every payout transaction (optional)
+broadcast = []
+# Requests per minute to `api`. 0 = no limit (your own relay). api.ark.io allows 200: use 170.
+requests_per_minute = 0
+# Blocks kept back from the tip before they are processed (protection against short forks)
+confirmations = 10
+# Seconds between checks
+poll_seconds = 20
+
+[validator]
+# Username, address or public key
+name = "myvalidator"
+# Start right after this block on `ark-tbw init` (0 = the current confirmed tip).
+# `ark-tbw init --from-height N` overrides it.
+start_height = 0
+
+[share]
+# Percentage of each block reward shared with voters. The keep is the rest (100 - percent).
+# Change it on the fly, from any block on:  ark-tbw share set 60
+percent = 50
+# Where the keep is paid. Default: it stays in the validator wallet (no transaction).
+# keep_address = "A..."
+# Share transaction fees in blocks too (default: fees go to the keep)
+fees = false
+# Minimum vote weight to be paid (ARK, inclusive), and cap on counted weight (0 = none)
+min_vote = 10
+max_vote = 0
+# Count each voter's unpaid rewards as weight, as if they had already been paid
+anti_dilution = true
+# Pay the validator wallet as a voter when it votes for itself (its weight then excludes
+# the rewards it holds for others)
+include_self = false
+# "redistribute": weight of excluded / below-minimum voters and stake above the cap is left
+#                 out, so eligible voters split the whole share.
+# "keep":         that weight still counts in the total, and what it would earn goes to the keep.
+ineligible = "redistribute"
+blacklist = []
+whitelist = []      # when not empty, only these voters are paid
+
+# Per-voter rates (percent of that voter's weight-share of the block). The difference to
+# `percent` goes to the keep.
+[share.custom]
+# "A..." = 90
+
+[payout]
+# false = shadow mode: everything is computed and recorded, nothing is sent
+enabled = true
+# Pay after this many of your own forged blocks (211 ~ one day)...
+every_blocks = 211
+# ...and/or at these UTC times
+at = []
+# Unpaid balances below this (ARK) carry over to the next payout
+min_amount = 0
+memo = "myvalidator - true block weight"
+# Memo on the keep payment (default: memo)
+# keep_memo = "keep"
+multipayment = true
+# Refuse to sign any transaction with a fee above this (ARK)
+max_fee = 0.5
+# Holds  passphrase = "..."  (and second_passphrase = "..." if the wallet has one).
+# Must be chmod 600. Relative to this file. A systemd credential named "secret" wins.
+secret_file = "secret.toml"
+
+# Send a voter's rewards to another address (accounting stays on the voter)
+[redirect]
+# "Avoter..." = "Apayto..."
+
+[storage]
+# Folder for ark-tbw.db (relative to this file)
+data_dir = "."
