@@ -9,6 +9,7 @@ mod log;
 mod payout;
 mod service;
 mod sync;
+mod upgrade;
 
 use anyhow::{anyhow, bail, Context, Result};
 use api::{Api, NodeInfo};
@@ -40,6 +41,7 @@ Day to day:
   ark-tbw payees                     recipients the multipayment cannot pay
   ark-tbw unblock 0xADDRESS          pay one through the multipayment again
   ark-tbw reload                     re-read the config after editing it
+  ark-tbw upgrade [--check]          install the newest release (keeps config, secret, data)
 
 The config is ~/.ark-tbw/config.toml unless -c/--config or ARK_TBW_CONFIG says otherwise.
 Every option is explained in config.example.toml. More: ark-tbw <command> --help";
@@ -132,6 +134,22 @@ enum Cmd {
     Restart,
     /// Re-read the config without a restart (systemctl reload ark-tbw)
     Reload,
+    /// Install the newest release of this network's branch and restart the service.
+    /// Config, secret and database are kept. Runs the branch's install.sh.
+    Upgrade {
+        /// Only show the installed and the latest version
+        #[arg(long)]
+        check: bool,
+        /// Install this release instead of the latest (e.g. 0.2.0 or the full tag)
+        #[arg(long)]
+        version: Option<String>,
+        /// Build from source with Rust instead of downloading the release binary
+        #[arg(long)]
+        from_source: bool,
+        /// Reinstall even when the installed version is the latest
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -183,6 +201,9 @@ fn real_main(cli: Cli) -> Result<()> {
         Cmd::Stop => return service::systemctl("stop"),
         Cmd::Restart => return service::systemctl("restart"),
         Cmd::Reload => return service::systemctl("reload"),
+        Cmd::Upgrade { check, version, from_source, force } => {
+            return upgrade::run(&config_path(&cli), *check, version.as_deref(), *from_source, *force)
+        }
         _ => {}
     }
     let cfg = load_config(&cli)?;

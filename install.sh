@@ -52,7 +52,7 @@ Options:
   -y, --yes           no questions: defaults, or TBW_VALIDATOR, TBW_API, TBW_SHARE,
                       TBW_KEEP, TBW_MEMO
 
-Re-run to upgrade: config, secret and database are kept, the service is restarted.
+Re-run to upgrade (or: ark-tbw upgrade): config, secret and database are kept, the service is restarted.
 USAGE
 }
 

@@ -51,8 +51,12 @@ It then runs `ark-tbw check` and shows `ark-tbw status`. Watch the shadow payout
 (`ark-tbw payouts`); to go live, fund the validator wallet, set `enabled = true` under
 `[payout]`, run `ark-tbw check`, then `ark-tbw reload`.
 
-**Upgrade:** run the same command again. The config, secret and database are kept and the
-service is restarted on the new binary.
+**Upgrade:** `ark-tbw upgrade` (as the same account, not root). It looks up the newest release
+of this branch, and when it is newer runs this branch's installer, which downloads and verifies
+the binary, keeps the config, secret and database, and restarts the service on the new binary.
+`ark-tbw upgrade --check` only shows the installed and the latest version; `--version X` installs
+a specific release, `--force` reinstalls the current one. Running the install command again does
+the same.
 
 Options go after `bash -s --`, for example:
 
@@ -173,6 +177,7 @@ root to set up. Only one kind can be installed at a time: remove one
 |---|---|
 | `ark-tbw start` / `stop` / `restart` | through systemctl (with sudo for the system service). A stop finishes the current step first |
 | `ark-tbw reload` | re-read the config without a restart (SIGHUP) |
+| `ark-tbw upgrade [--check]` | install the newest release, keep config, secret and data |
 | `ark-tbw logs` | last 100 log lines |
 | `ark-tbw logs -f` | follow the log |
 | `ark-tbw logs --since "1 hour ago"` | log since a time |
