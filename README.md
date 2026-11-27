@@ -24,7 +24,55 @@ How it works, and why true block weight is possible with the existing Mainsail A
 Runs on Ubuntu 22.04, 24.04 and 26.04 (x86_64 and arm64). The binary is static: no runtime
 dependencies.
 
-## Install
+## Install with the install script
+
+This installs the Mainsail version (branch `mainsail`). For ARK Core v3, use the script on
+[`main`](https://github.com/geopsllc/ark-tbw#install-with-the-install-script).
+
+On the server, as the account that should run ark-tbw (not root; it asks for sudo when needed):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/geopsllc/ark-tbw/mainsail/install.sh | bash
+```
+
+It asks for your validator, the node API (your node on `127.0.0.1:4003` when it finds one,
+else the public testnet gateway), the voter share, the memo and the passphrase, then:
+
+| | |
+|---|---|
+| binary | `/usr/local/bin/ark-tbw` (a release download, checked against its SHA256SUMS; built from source with Rust when no release is published) |
+| config | `~/.ark-tbw/config.toml`, payouts in **shadow mode** (`payout.enabled = false`) |
+| passphrase | `~/.ark-tbw/secret.toml`, chmod 600 (Enter skips it; add it before you go live) |
+| database | `~/.ark-tbw/ark-tbw.db`, initialised at the current tip |
+| service | the systemd system service, enabled at boot and started |
+
+It then runs `ark-tbw check` and shows `ark-tbw status`. Watch the shadow payouts
+(`ark-tbw payouts`); to go live, fund the validator wallet, set `enabled = true` under
+`[payout]`, run `ark-tbw check`, then `ark-tbw reload`.
+
+**Upgrade:** run the same command again. The config, secret and database are kept and the
+service is restarted on the new binary.
+
+Options go after `bash -s --`, for example:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/geopsllc/ark-tbw/mainsail/install.sh | bash -s -- --rootless --from-height 24700000
+```
+
+| option | |
+|---|---|
+| `--rootless` | user service and `~/.local/bin`, no sudo at all (see [Rootless user service](#rootless-user-service-no-sudo)) |
+| `--from-height N` | start the database right after block N instead of the tip |
+| `--from-source` | build with Rust instead of downloading a release |
+| `--version TAG` | install a specific release |
+| `--dir DIR` | config folder other than `~/.ark-tbw` |
+| `--no-service` | install and initialise only |
+| `-y` | no questions: defaults, or the values in `TBW_VALIDATOR`, `TBW_API`, `TBW_SHARE`, `TBW_MEMO` |
+
+With `--rootless`, install `curl`, `build-essential` and `git` first if they are missing (the
+script cannot use sudo then).
+
+## Install by hand
 
 Build a static binary (on any machine with Docker), or build on the server with Rust:
 
@@ -135,6 +183,9 @@ fix, such as a bad config or a processed block that changed, so you can look fir
 `journalctl --user -u ark-tbw`).
 
 ## Day to day
+
+`ark-tbw --help` lists every command with examples; `ark-tbw <command> --help` shows its
+options (`install.sh --help` does the same for the installer).
 
 ```bash
 ark-tbw status              # sync height, share, next payout, unpaid totals
