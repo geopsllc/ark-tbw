@@ -1,20 +1,28 @@
-# ark-tbw configuration. Copy to ~/.ark-tbw/config.toml and edit.
+# ark-tbw configuration (Mainsail). Copy to ~/.ark-tbw/config.toml and edit.
 # Every setting is checked at start-up; a bad value stops the service with a clear message.
+# Addresses are 0x addresses. Mixed-case ones must match their checksum (catches typos).
 
 [network]
-# Your relay's API (fast, no rate limit), or a public one such as https://api.ark.io/api
+# Your node's REST API (fastest), or the public testnet gateway https://testnet.mainsailhq.com/api
 api = "http://127.0.0.1:4003/api"
-# Extra nodes that also receive every payout transaction (optional)
+# JSON-RPC (account history for exact balances, gas estimates) and the transaction pool API.
+# Default: next to `api` (ports 4008 and 4007 on a node; /rpc/api and /tx/api on the gateway).
+# rpc = "http://127.0.0.1:4008/api"
+# tx_api = "http://127.0.0.1:4007/api"
+# Extra transaction pool APIs that also receive every payout transaction (optional)
 broadcast = []
-# Requests per minute to `api`. 0 = no limit (your own relay). api.ark.io allows 200: use 170.
+# Requests per minute to `api`. 0 = no limit (your own node or the testnet gateway).
 requests_per_minute = 0
-# Blocks kept back from the tip before they are processed (protection against short forks)
-confirmations = 10
+# JSON-RPC requests per minute. The public gateway allows 150; a batch counts as one.
+rpc_requests_per_minute = 120
+# Blocks kept back from the tip before they are processed. Mainsail blocks are final once
+# committed, so a few are enough; keep it well below the node's 256-block account history.
+confirmations = 3
 # Seconds between checks
-poll_seconds = 20
+poll_seconds = 15
 
 [validator]
-# Username, address or public key
+# Username or 0x address
 name = "myvalidator"
 # Start right after this block on `ark-tbw init` (0 = the current confirmed tip).
 # `ark-tbw init --from-height N` overrides it.
@@ -25,7 +33,7 @@ start_height = 0
 # Change it on the fly, from any block on:  ark-tbw share set 60
 percent = 50
 # Where the keep is paid. Default: it stays in the validator wallet (no transaction).
-# keep_address = "A..."
+# keep_address = "0x..."
 # Share transaction fees in blocks too (default: fees go to the keep)
 fees = false
 # Minimum vote weight to be paid (ARK, inclusive), and cap on counted weight (0 = none)
@@ -46,30 +54,37 @@ whitelist = []      # when not empty, only these voters are paid
 # Per-voter rates (percent of that voter's weight-share of the block). The difference to
 # `percent` goes to the keep.
 [share.custom]
-# "A..." = 90
+# "0x..." = 90
 
 [payout]
 # false = shadow mode: everything is computed and recorded, nothing is sent
 enabled = true
-# Pay after this many of your own forged blocks (211 ~ one day)...
-every_blocks = 211
+# Pay after this many of your own proposed blocks. With 53 validators and ~10 s blocks you
+# propose about one block in 9 minutes: 160 is about a day...
+every_blocks = 160
 # ...and/or at these UTC times
 at = []
 # Unpaid balances below this (ARK) carry over to the next payout
 min_amount = 0
+# Memo in the data of single transfers (multipayments carry no memo)
 memo = "myvalidator - true block weight"
-# Memo on the keep payment (default: memo)
+# Memo on the keep payment when it is a single transfer (default: memo)
 # keep_memo = "keep"
+# Pay many voters per transaction through the MultiPayment contract (up to 205 per
+# transaction, packed by gas; every transaction is checked with eth_estimateGas first)
 multipayment = true
-# Refuse to sign any transaction with a fee above this (ARK)
-max_fee = 0.5
+# Gas price in gwei (default: the network minimum, 5)
+# gas_price = 5
+# Refuse to sign any transaction whose fee (gas limit x gas price) is above this (ARK).
+# A full multipayment costs 5,000,000 x 5 gwei = 0.025.
+max_fee = 0.1
 # Holds  passphrase = "..."  (and second_passphrase = "..." if the wallet has one).
 # Must be chmod 600. Relative to this file. A systemd credential named "secret" wins.
 secret_file = "secret.toml"
 
 # Send a voter's rewards to another address (accounting stays on the voter)
 [redirect]
-# "Avoter..." = "Apayto..."
+# "0xvoter..." = "0xpayto..."
 
 [storage]
 # Folder for ark-tbw.db (relative to this file)

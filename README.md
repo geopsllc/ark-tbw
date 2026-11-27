@@ -1,20 +1,25 @@
-# ark-tbw
+# ark-tbw (Mainsail)
 
-All-in-one **true block weight** reward sharing for ARK Core v3 validators: it follows the chain,
-splits every block you forge between your voters by their weight at that block, and pays them.
-One binary, one SQLite file, run by systemd. No separate calculation and payment scripts, no
-pm2, no PostgreSQL access needed.
+All-in-one **true block weight** reward sharing for ARK Mainsail validators: it follows the
+chain, splits every block you propose between your voters by their weight at that block, and
+pays them. One binary, one SQLite file, run by systemd.
 
-- **Fast:** reads only your forged blocks and the chain's transactions (a month of catch-up is a
-  few hundred API requests), instead of scanning every block for every voter.
-- **Exact:** integer math; every block splits to exactly reward + fee. Checked against a real
-  core3-tbw payout cycle on mainnet: same 106 recipients, every voter within 0.00002 ARK.
+> This is the `mainsail` branch, for the current Mainsail testnet (chain id 11812, TARK). The
+> ARK Core v3 version is on `main`. The two use different databases.
+
+- **Exact:** voter balances follow the chain's transactions, and every block you propose
+  within the node's 256-block account history is checked against the node's own balances
+  (one batched JSON-RPC call). Integer math; every block splits to exactly reward + fees.
+- **Fast:** reads only your blocks and the chain's transactions, not every block for every voter.
 - **Safe payouts:** a set of payments is bound to one wallet nonce when it is signed, so it can
   never be paid twice, even across crashes, restarts or network errors.
+- **Big multipayments:** up to 205 voters per transaction, packed by gas and checked with
+  `eth_estimateGas` before signing.
 - **Live changes:** change the share from any block on, pay now, cancel a stuck payout, reload
   the config, all while it runs.
 
-How it works and the edge cases it handles: [DESIGN.md](DESIGN.md).
+How it works, and why true block weight is possible with the existing Mainsail API:
+[DESIGN.md](DESIGN.md).
 
 Runs on Ubuntu 22.04, 24.04 and 26.04 (x86_64 and arm64). The binary is static: no runtime
 dependencies.
@@ -39,7 +44,12 @@ mkdir -p ~/.ark-tbw && cp config.example.toml ~/.ark-tbw/config.toml
 nano ~/.ark-tbw/config.toml
 ```
 
-The passphrase lives in its own file, readable only by you:
+Your node serves the REST API on port 4003, JSON-RPC on 4008 and the transaction pool on 4007;
+ark-tbw finds the other two from `network.api`. Without a node of your own, use the public
+gateway `https://testnet.mainsailhq.com/api`.
+
+The passphrase lives in its own file, readable only by you. Mainsail keeps the ARK key scheme,
+so it is the same passphrase as the validator's wallet:
 
 ```bash
 install -m 600 /dev/null ~/.ark-tbw/secret.toml
@@ -50,15 +60,11 @@ Initialise: this reads your voters as of the start height (default: now).
 
 ```bash
 ark-tbw init                         # start now
-ark-tbw init --from-height 37900000  # or catch up and pay from a given block
-ark-tbw init --import-core3 ~/core3-tbw/core/data/tbw.db   # or continue a core3-tbw install
+ark-tbw init --from-height 24700000  # or catch up and pay from a given block
 ```
 
-With `--import-core3`, stop core3-tbw first (`pm2 stop tbw pay`). ark-tbw takes over its unpaid
-balances and continues right after the last block it processed. Custom rates found in the old
-database are listed so you can add them to `[share.custom]`.
-
-Check everything (node, validator, secret, balance) without changing anything:
+Check everything (node, JSON-RPC history, pool, validator, secret, balance) without changing
+anything:
 
 ```bash
 ark-tbw check
@@ -124,8 +130,8 @@ root to set up. Only one kind can be installed at a time: remove one
 | `ark-tbw service uninstall` | remove the service, with sudo for the system service (config and database stay) |
 
 The service restarts itself on failure. It stays stopped (exit code 2) on errors a restart cannot
-fix, such as a bad config or a chain reorganisation deeper than `network.confirmations`, so you
-can look first. `ark-tbw logs` reads journald, the same as `journalctl -u ark-tbw` (rootless:
+fix, such as a bad config or a processed block that changed, so you can look first.
+`ark-tbw logs` reads journald, the same as `journalctl -u ark-tbw` (rootless:
 `journalctl --user -u ark-tbw`).
 
 ## Day to day
@@ -133,16 +139,17 @@ can look first. `ark-tbw logs` reads journald, the same as `journalctl -u ark-tb
 ```bash
 ark-tbw status              # sync height, share, next payout, unpaid totals
 ark-tbw voters              # weight, unpaid and paid per voter (--all: incl. former voters)
-ark-tbw blocks              # your last forged blocks and how each was split
+ark-tbw blocks              # your last proposed blocks and how each was split
 ark-tbw payouts             # payout history;  ark-tbw payouts 12  for one payout in detail
 ark-tbw pay-now             # pay out now instead of waiting for the next trigger
+ark-tbw payees              # recipients that cannot be paid through the multipayment
 ```
 
 ### Changing the share
 
 ```bash
 ark-tbw share set 60                       # from the next block on
-ark-tbw share set 55 --from-height 38000000
+ark-tbw share set 55 --from-height 24800000
 ark-tbw share                              # the schedule
 ```
 
@@ -153,25 +160,36 @@ The keep is always 100% − share. Blocks already processed keep the share they 
 
 ```toml
 [redirect]
-"Avoter..." = "Apayto..."
+"0xvoter..." = "0xpayto..."
 ```
 
 The voter's rewards are still computed and tracked on its own address; only the payment goes to
 the other address. Run `ark-tbw reload` afterwards.
 
+### Recipients that cannot receive
+
+The MultiPayment contract forwards each amount with a small gas stipend. A recipient that is a
+contract needing more gas to receive gets nothing from it: the contract reports that payment as
+failed and returns the amount to your wallet in the same transaction. ark-tbw reads that result
+per recipient, puts the amount back on the voter's unpaid balance and pays that recipient with
+its own transfer from then on. If even a plain transfer fails, the recipient is skipped (its
+rewards keep accruing) until you set a `[redirect]` for it. `ark-tbw payees` lists them;
+`ark-tbw unblock 0x...` tries the multipayment again.
+
 ### Stuck payouts
 
 A payout waits for each of its transactions to be confirmed. One that drops out of the pool is
-broadcast again; a fee rejection re-signs it with the same nonce and a higher fee. If a
-transaction still never confirms (`ark-tbw payouts ID`), cancel it:
+broadcast again; a gas price rejection re-signs it with the same nonce and twice the gas price
+(within `payout.max_fee`). If a transaction still never confirms (`ark-tbw payouts ID`), cancel
+it:
 
 ```bash
 ark-tbw cancel-payout ID
 ```
 
-This takes the transaction's nonce with a 1-arktoshi transfer to your own wallet. Whatever takes
-the nonce first wins: if the payment does, it is paid; if the cancel does, the amounts go back to
-the voters' unpaid balances for the next payout. Nothing can be paid twice.
+This takes the transaction's nonce with a zero-value transfer to your own wallet at a higher gas
+price. Whatever takes the nonce first wins: if the payment does, it is paid; if the cancel does,
+the amounts go back to the voters' unpaid balances for the next payout. Nothing can be paid twice.
 
 ## Configuration
 
@@ -179,25 +197,33 @@ See [config.example.toml](config.example.toml); every option is documented there
 
 | option | |
 |---|---|
-| `network.api` | your relay (`http://127.0.0.1:4003/api`, fastest) or `https://api.ark.io/api` with `requests_per_minute = 170` |
+| `network.api` | your node (`http://127.0.0.1:4003/api`, fastest) or `https://testnet.mainsailhq.com/api` |
+| `network.rpc`, `network.tx_api` | JSON-RPC and pool API; derived from `network.api` by default |
+| `network.confirmations` | blocks kept back from the tip (default 3; must stay well under 256) |
 | `share.percent` | share for voters; the keep is the rest |
 | `share.keep_address` | where the keep goes (default: stays in the validator wallet) |
 | `share.min_vote`, `share.max_vote` | minimum weight to be paid, and the cap on counted weight |
 | `share.fees` | share transaction fees too (default: they go to the keep) |
-| `share.anti_dilution` | count unpaid rewards as weight (core3-tbw always did) |
+| `share.anti_dilution` | count unpaid rewards as weight |
 | `share.blacklist`, `share.whitelist`, `[share.custom]` | exclude, restrict, or set per-voter rates |
 | `payout.every_blocks`, `payout.at` | pay every N of your own blocks and/or at UTC times |
 | `payout.min_amount` | smaller balances carry over |
+| `payout.gas_price`, `payout.max_fee` | gas price in gwei (default: network minimum), and the most one transaction may cost |
 | `payout.enabled` | `false` = shadow mode |
 
-Transaction fees are the network's minimum dynamic fee and are paid from the keep. If the keep is
-short, the fees are carried as keep debt and paid off by later blocks.
+Fees are gas used × gas price and are paid from the keep: it is charged gas limit × price when a
+transaction is signed and refunded the difference once it confirms. If the keep is short, the
+fees are carried as keep debt and paid off by later blocks. A 200-voter multipayment uses about
+4.9 million gas, 0.0245 TARK at 5 gwei.
+
+Amounts in the database and on screen have 8 decimals, as on ARK Core; on chain they are wei
+(18 decimals). A voter's weight is its balance rounded down to 8 decimals.
 
 ## Development
 
 ```bash
 cargo test                                          # unit tests (no network)
-cargo test broadcast_unfunded -- --ignored          # posts a transaction from an empty wallet to mainnet; must be rejected
+cargo test broadcast_unfunded -- --ignored          # posts a multipayment from an empty testnet wallet; must be rejected
 tools/test-ubuntu.sh                                # runs the Linux binary on Ubuntu 22.04 / 24.04 / 26.04 in Docker
 ```
 

@@ -6,19 +6,21 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::HashMap;
 use std::path::Path;
 
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
+/// Which chain this database follows. Core v3 databases (schema 1) cannot be opened here.
+pub const CHAIN: &str = "mainsail";
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 
 -- every wallet that has voted for the validator since the start height, with its state at last_height
+-- (balance in wei as decimal text: 18-decimal amounts do not fit a 64-bit integer)
 CREATE TABLE IF NOT EXISTS wallets (
   address TEXT PRIMARY KEY,
   public_key TEXT,
-  balance INTEGER NOT NULL,
-  locked INTEGER NOT NULL DEFAULT 0,
+  balance TEXT NOT NULL,
   voting INTEGER NOT NULL,
-  validator INTEGER NOT NULL DEFAULT 0,   -- forges blocks: its rewards change its balance
+  validator INTEGER NOT NULL DEFAULT 0,   -- proposes blocks: reward + fees change its balance
   first_seen INTEGER NOT NULL
 );
 
@@ -29,6 +31,7 @@ CREATE TABLE IF NOT EXISTS share_changes (
   created_at INTEGER NOT NULL
 );
 
+-- amounts below are in units of 1e-8 ARK (1e10 wei), like Core v3's arktoshi
 -- what each voter / keep has earned (unpaid may go negative for the keep: fee debt)
 CREATE TABLE IF NOT EXISTS accounts (
   address TEXT PRIMARY KEY,
@@ -37,7 +40,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   paid INTEGER NOT NULL DEFAULT 0
 );
 
--- the validator's own forged blocks and how each was split
+-- the validator's own proposed blocks and how each was split
 CREATE TABLE IF NOT EXISTS blocks (
   height INTEGER PRIMARY KEY,
   id TEXT NOT NULL,
@@ -84,7 +87,7 @@ CREATE TABLE IF NOT EXISTS payout_items (
 CREATE TABLE IF NOT EXISTS slots (
   nonce INTEGER PRIMARY KEY,
   payout_id INTEGER NOT NULL,
-  fee INTEGER NOT NULL,         -- fee charged to the keep for this slot
+  fee INTEGER NOT NULL,         -- fee charged to the keep for this slot (gas limit x price, settled to gas used)
   status TEXT NOT NULL,         -- pending | confirmed | failed
   tx_id TEXT,                   -- the variant that confirmed
   confirmed_height INTEGER,
@@ -101,6 +104,15 @@ CREATE TABLE IF NOT EXISTS variants (
   fee INTEGER NOT NULL,
   json TEXT NOT NULL,
   created_at INTEGER NOT NULL
+);
+
+-- payees that a multipayment could not pay (e.g. a contract that rejects value with the 5000 gas
+-- stipend): 'direct' = pay with a plain transfer; 'blocked' = that failed too, set a redirect
+CREATE TABLE IF NOT EXISTS payees (
+  address TEXT PRIMARY KEY,
+  mode TEXT NOT NULL,
+  reason TEXT,
+  at INTEGER NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS commands (
@@ -126,9 +138,13 @@ pub fn open(path: &Path) -> Result<Connection> {
     match v {
         None => {
             c.execute("INSERT INTO meta(key,value) VALUES('schema',?1)", params![SCHEMA_VERSION.to_string()])?;
+            c.execute("INSERT INTO meta(key,value) VALUES('chain',?1)", params![CHAIN])?;
         }
         Some(v) if v.parse::<i64>().unwrap_or(0) > SCHEMA_VERSION => {
             bail!("database {} was written by a newer ark-tbw", path.display())
+        }
+        Some(v) if v.parse::<i64>().unwrap_or(0) < SCHEMA_VERSION || get(&c, "chain")?.as_deref() != Some(CHAIN) => {
+            bail!("database {} belongs to the ARK Core v3 version of ark-tbw; the Mainsail version needs its own (use another storage.data_dir)", path.display())
         }
         _ => {}
     }
@@ -155,36 +171,39 @@ pub fn set(c: &Connection, key: &str, value: &str) -> Result<()> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct WalletRow {
     pub public_key: Option<String>,
-    pub balance: i64,
-    pub locked: i64,
+    /// wei
+    pub balance: u128,
     pub voting: bool,
     pub validator: bool,
     pub first_seen: u64,
 }
 
 pub fn load_wallets(c: &Connection) -> Result<HashMap<String, WalletRow>> {
-    let mut st = c.prepare("SELECT address, public_key, balance, locked, voting, validator, first_seen FROM wallets")?;
+    let mut st = c.prepare("SELECT address, public_key, balance, voting, validator, first_seen FROM wallets")?;
     let rows = st.query_map([], |r| {
         Ok((
             r.get::<_, String>(0)?,
-            WalletRow {
-                public_key: r.get(1)?,
-                balance: r.get(2)?,
-                locked: r.get(3)?,
-                voting: r.get::<_, i64>(4)? != 0,
-                validator: r.get::<_, i64>(5)? != 0,
-                first_seen: r.get::<_, i64>(6)? as u64,
-            },
+            r.get::<_, Option<String>>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)? != 0,
+            r.get::<_, i64>(4)? != 0,
+            r.get::<_, i64>(5)? as u64,
         ))
     })?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+    let mut out = HashMap::new();
+    for row in rows {
+        let (a, public_key, bal, voting, validator, first_seen) = row?;
+        let balance = bal.parse::<u128>().with_context(|| format!("bad balance {bal:?} for {a} in the database"))?;
+        out.insert(a, WalletRow { public_key, balance, voting, validator, first_seen });
+    }
+    Ok(out)
 }
 
 pub fn save_wallet(c: &Connection, address: &str, w: &WalletRow) -> Result<()> {
     c.execute(
-        "INSERT INTO wallets(address, public_key, balance, locked, voting, validator, first_seen) VALUES(?1,?2,?3,?4,?5,?6,?7)
-         ON CONFLICT(address) DO UPDATE SET public_key=excluded.public_key, balance=excluded.balance, locked=excluded.locked, voting=excluded.voting, validator=excluded.validator",
-        params![address, w.public_key, w.balance, w.locked, w.voting as i64, w.validator as i64, w.first_seen as i64],
+        "INSERT INTO wallets(address, public_key, balance, voting, validator, first_seen) VALUES(?1,?2,?3,?4,?5,?6)
+         ON CONFLICT(address) DO UPDATE SET public_key=excluded.public_key, balance=excluded.balance, voting=excluded.voting, validator=excluded.validator",
+        params![address, w.public_key, w.balance.to_string(), w.voting as i64, w.validator as i64, w.first_seen as i64],
     )?;
     Ok(())
 }
@@ -254,4 +273,19 @@ pub fn share_changes(c: &Connection) -> Result<Vec<(u64, u64)>> {
     let mut st = c.prepare("SELECT height, voter_bps FROM share_changes ORDER BY height")?;
     let rows = st.query_map([], |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, i64>(1)? as u64)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Payees that need a plain transfer ('direct') or cannot be paid at all ('blocked').
+pub fn payees(c: &Connection) -> Result<HashMap<String, String>> {
+    let mut st = c.prepare("SELECT address, mode FROM payees")?;
+    let rows = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+pub fn set_payee(c: &Connection, address: &str, mode: &str, reason: &str) -> Result<()> {
+    c.execute(
+        "INSERT INTO payees(address, mode, reason, at) VALUES(?1,?2,?3,?4) ON CONFLICT(address) DO UPDATE SET mode=excluded.mode, reason=excluded.reason, at=excluded.at",
+        params![address, mode, reason, now()],
+    )?;
+    Ok(())
 }

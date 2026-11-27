@@ -1,7 +1,7 @@
 [package]
 name = "ark-tbw"
 version = "0.1.0"
-description = "All-in-one true block weight reward sharing for ARK Core v3 validators"
+description = "All-in-one true block weight reward sharing for ARK Mainsail validators"
 edition = "2021"
 license-file = "LICENSE"
 publish = false
@@ -19,8 +19,7 @@ libc = "0.2"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 k256 = { version = "0.13", features = ["ecdsa", "arithmetic", "expose-field"] }
 sha2 = "0.10"
-ripemd = "0.1"
-bs58 = { version = "0.5", features = ["check"] }
+sha3 = "0.10"
 bip39 = "2"
 hex = "0.4"
 zeroize = "1"

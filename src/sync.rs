@@ -1,18 +1,29 @@
-//! The chain follower, event driven. For a height range it reads only:
-//!   - the validator's own forged blocks (one request per 100 of them, ~2 per day of chain),
-//!   - every transaction by timestamp (ARK mainnet carries a few hundred a day),
-//!   - blocks forged by voters that are validators themselves (their rewards are balance).
-//! Each block has its own timestamp and a transaction carries its block's, so ordering
-//! transactions against our blocks needs no per-block reads at all. A month of catch-up
-//! costs ~200 requests; the original script ran several full-table queries per voter per block.
+//! The chain follower for Mainsail, event driven. For a height range it reads only:
+//!   - the validator's own proposed blocks,
+//!   - every transaction by timestamp, with its receipt and logs,
+//!   - blocks proposed by voters that are validators themselves (reward + fees are balance).
+//! Each block and its transactions share one timestamp, so ordering transactions against our
+//! blocks needs no per-block reads.
 //!
-//! Each forged block is split by the votes as they stood after that block.
+//! Balances follow from the transactions: gas, value, multipayment Payment logs (with their
+//! success flag), validator registration and resignation refunds. Votes follow from the
+//! consensus contract's Voted/Unvoted logs.
+//!
+//! The REST API has no historical balances, but the node's JSON-RPC keeps account history for
+//! the last 256 blocks. Every own block within that window is checked against the node: one
+//! batched eth_getBalance for all voters at that block. A difference (native value moved by a
+//! third-party contract, which no log shows) is logged and the node's value is used. So live
+//! following is exact; only a catch-up older than the window relies on the events alone, and
+//! the reconcile at the tip shows anything that slipped through there.
+//!
+//! Each own block is split by the votes as they stood after that block.
 
 use crate::alloc::{self, VoterIn};
-use crate::api::{Api, Block, Tx, Wallet};
+use crate::api::{Api, Block, Tx, Wallet, HISTORY_SAFE};
 use crate::chain;
-use crate::config::{fmt_ark, Config};
+use crate::config::{fmt_ark, sym, Config};
 use crate::db::{self, Account, WalletRow};
+use crate::evm::WEI_PER_UNIT;
 use crate::{info, warn};
 use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection};
@@ -26,79 +37,103 @@ pub struct Me {
     pub username: String,
     pub address: String,
     pub public_key: String,
-    pub network: u8,
+    pub chain_id: u64,
 }
 
 impl Me {
     pub fn load(c: &Connection) -> Result<Me> {
         let g = |k: &str| -> Result<String> { db::get(c, k)?.ok_or_else(|| anyhow!("database is not initialized: run  ark-tbw init")) };
-        Ok(Me { username: g("username")?, address: g("validator_address")?, public_key: g("validator_public_key")?, network: g("network")?.parse()? })
+        Ok(Me { username: g("username")?, address: g("validator_address")?, public_key: g("validator_public_key")?, chain_id: g("chain_id")?.parse()? })
     }
 }
 
-type HtlcCache = HashMap<String, (String, String, u64)>;
+/// Wei as an amount of ARK for messages.
+pub fn ark(wei: u128) -> String {
+    format!("{} {}", fmt_ark((wei / WEI_PER_UNIT) as i128), sym())
+}
 
-fn htlc_lookup<'c>(api: &'c mut Api, cache: &'c mut HtlcCache) -> impl FnMut(&str) -> Result<(String, String, u64)> + 'c {
-    move |id: &str| {
-        if let Some(v) = cache.get(id) {
-            return Ok(v.clone());
+/// Vote weight of a balance: units of 1e-8 ARK, as on ARK Core.
+pub fn weight(wei: u128) -> u64 {
+    (wei / WEI_PER_UNIT).min(u64::MAX as u128) as u64
+}
+
+/// Block reward plus fees in ledger units (1e-8 ARK), rounded down: never share more than came in.
+fn units(wei: u128) -> u64 {
+    weight(wei)
+}
+
+/// Registration fees, for the refund a resigning validator gets back.
+type FeeCache = HashMap<String, u128>;
+
+/// The fee `addr` locked when it registered as a validator: the value of its last successful
+/// registration. Validators that came with the chain's genesis paid none.
+fn registration_fee(api: &mut Api, cache: &mut FeeCache, addr: &str) -> Result<u128> {
+    if let Some(v) = cache.get(addr) {
+        return Ok(*v);
+    }
+    let txs = api.wallet_txs(addr, 0)?;
+    let v = txs.iter().rev().find(|t| t.from == addr && chain::registrations(t).iter().any(|r| r == addr)).map(|t| t.value).unwrap_or(0);
+    cache.insert(addr.to_string(), v);
+    Ok(v)
+}
+
+/// Look up the refund of every resignation in `txs` that touches a wallet in `tracked`.
+fn prefetch_refunds<'t>(api: &mut Api, cache: &mut FeeCache, txs: impl Iterator<Item = &'t Tx>, tracked: &dyn Fn(&str) -> bool) -> Result<()> {
+    for t in txs {
+        for r in chain::resignations(t) {
+            if tracked(&r) {
+                registration_fee(api, cache, &r)?;
+            }
         }
-        let t = api.tx(id)?.ok_or_else(|| anyhow!("HTLC lock transaction {id} not found"))?;
-        let v = (t.sender.clone(), t.recipient.clone().unwrap_or_default(), t.amount);
-        cache.insert(id.to_string(), v.clone());
-        Ok(v)
     }
+    Ok(())
 }
 
-/// A wallet's state just before timestamp `from_ts` (after the block before it): its current
-/// state minus its history since then. `history` must hold every transaction touching it
-/// since from_ts, and `forged` every block it forged since then.
-fn rebuild(api: &mut Api, htlc: &mut HtlcCache, validator_pk: &str, w: &Wallet, history: &[&Tx], forged: &[Block], from_height: u64) -> Result<WalletRow> {
-    let mut bal = w.balance as i64;
-    let mut locked = w.locked as i64;
-    let mut look = htlc_lookup(api, htlc);
+/// A wallet's state just before timestamp `from_ts`: its current state minus its history since
+/// then. `history` must hold every transaction touching it since from_ts, and `forged` every
+/// block it proposed since then.
+fn rebuild(fees: &FeeCache, validator: &str, w: &Wallet, history: &[&Tx], forged: &[Block], from_height: u64) -> Result<WalletRow> {
+    let mut bal = w.balance as i128;
     let mut first_vote: Option<bool> = None;
+    let mut validator_since = false;
+    let mut refund = |a: &str| fees.get(a).copied().unwrap_or(0);
     for t in history {
-        let (b, l) = chain::delta(t, &w.address, &mut look)?;
-        bal -= b;
-        locked -= l;
-        if t.sender == w.address && first_vote.is_none() {
-            first_vote = chain::vote_change(t, validator_pk);
+        bal -= chain::delta(t, &w.address, &mut refund);
+        if first_vote.is_none() {
+            first_vote = chain::vote_change(t, validator, &w.address);
+        }
+        if chain::registrations(t).iter().any(|r| *r == w.address) {
+            validator_since = true;
         }
     }
     for b in forged {
-        bal -= (b.reward + b.fee) as i64;
+        bal -= (b.reward + b.fee) as i128;
     }
-    // first vote event after that point: "+us" means it was not voting for us before, "-us" means it was
+    // first vote event after that point: "voted for us" means it was not voting for us before
     let voting = match first_vote {
         Some(v) => !v,
-        None => w.vote.as_deref() == Some(validator_pk),
+        None => w.vote.as_deref() == Some(validator),
     };
-    if bal < 0 || locked < 0 {
+    if bal < 0 {
         bail!("rebuilt a negative balance for {} at height {}: the API history looks incomplete", w.address, from_height.saturating_sub(1));
     }
-    Ok(WalletRow { public_key: w.public_key.clone(), balance: bal, locked, voting, validator: w.username.is_some(), first_seen: from_height })
+    Ok(WalletRow { public_key: w.public_key.clone(), balance: bal as u128, voting, validator: w.validator && !validator_since, first_seen: from_height })
 }
 
 /// Bring in one wallet as of just before block `from_height` (timestamp `from_ts`). History and
 /// state are read twice; any transaction landing in between makes it try again.
-pub fn onboard(api: &mut Api, htlc: &mut HtlcCache, validator_pk: &str, address: &str, from_ts: u64, from_height: u64) -> Result<WalletRow> {
+pub fn onboard(api: &mut Api, fees: &mut FeeCache, validator: &str, address: &str, from_ts: u64, from_height: u64) -> Result<WalletRow> {
     for attempt in 0..8u64 {
         let h1 = api.wallet_txs(address, from_ts)?;
         let w1 = api.wallet(address)?.ok_or_else(|| anyhow!("wallet {address} not found"))?;
-        // blocks it forged from that point on (from_height is only a lower bound)
-        let forged: Vec<Block> =
-            if w1.username.is_some() { api.forged_since(address, from_height)?.into_iter().filter(|b| b.ts >= from_ts).collect() } else { Vec::new() };
+        let forged: Vec<Block> = if w1.validator { api.forged_since(address, from_height)?.into_iter().filter(|b| b.ts >= from_ts).collect() } else { Vec::new() };
         let h2 = api.wallet_txs(address, from_ts)?;
         let w2 = api.wallet(address)?.ok_or_else(|| anyhow!("wallet {address} not found"))?;
-        let same = h1.len() == h2.len()
-            && h1.iter().zip(&h2).all(|(a, b)| a.id == b.id)
-            && w1.balance == w2.balance
-            && w1.locked == w2.locked
-            && w1.produced_blocks == w2.produced_blocks;
+        let same = h1.len() == h2.len() && h1.iter().zip(&h2).all(|(a, b)| a.id == b.id) && w1.balance == w2.balance && w1.nonce == w2.nonce && w1.last_block == w2.last_block;
         if same {
+            prefetch_refunds(api, fees, h2.iter(), &|a| a == address)?;
             let refs: Vec<&Tx> = h2.iter().collect();
-            return rebuild(api, htlc, validator_pk, &w2, &refs, &forged, from_height);
+            return rebuild(fees, validator, &w2, &refs, &forged, from_height);
         }
         if attempt > 2 {
             warn!("wallet {address} keeps changing while it is read, retrying");
@@ -113,12 +148,12 @@ pub struct Events {
     pub to: Block,
     pub own: Vec<Block>,
     pub txs: Vec<Tx>,
-    /// blocks forged by tracked wallets that are validators (not us)
+    /// blocks proposed by tracked wallets that are validators (not us)
     pub forged: Vec<Block>,
 }
 
 pub fn fetch_events(api: &mut Api, me: &Me, validators: &BTreeSet<String>, from: u64, from_ts: u64, to: u64) -> Result<Events> {
-    let end = api.block(&to.to_string())?.ok_or_else(|| anyhow!("block {to} not found"))?;
+    let end = api.block(to)?.ok_or_else(|| anyhow!("block {to} not found"))?;
     let own = api.forged_range(&me.address, from, to)?;
     let txs = if end.ts > from_ts { api.txs_by_time(from_ts + 1, end.ts)? } else { Vec::new() };
     let mut forged = Vec::new();
@@ -141,19 +176,25 @@ pub struct Engine<'a> {
     pub last_height: u64,
     pub last_id: String,
     pub last_ts: u64,
-    htlc: HtlcCache,
+    fees: FeeCache,
+    /// highest block the node is known to have (for the account history window)
+    tip_hint: u64,
 }
 
 pub struct ChunkResult {
     pub height: u64,
     pub own_blocks: u64,
+    /// own blocks checked against the node's balances / wallets corrected at them
+    pub verified: u64,
+    pub corrected: u64,
     pub payout_due: bool,
 }
 
 impl<'a> Engine<'a> {
     pub fn load(cfg: &'a Config, api: &'a mut Api, conn: &'a mut Connection) -> Result<Engine<'a>> {
         let me = Me::load(conn)?;
-        let mut e = Engine { cfg, api, conn, me, wallets: HashMap::new(), accounts: HashMap::new(), last_height: 0, last_id: String::new(), last_ts: 0, htlc: HashMap::new() };
+        let mut e =
+            Engine { cfg, api, conn, me, wallets: HashMap::new(), accounts: HashMap::new(), last_height: 0, last_id: String::new(), last_ts: 0, fees: HashMap::new(), tip_hint: 0 };
         e.reload()?;
         Ok(e)
     }
@@ -199,7 +240,7 @@ impl<'a> Engine<'a> {
             return Ok(None);
         }
         // the block we stopped at must still be on the chain
-        let here = self.api.block(&self.last_height.to_string())?.ok_or_else(|| anyhow!("block {} not found", self.last_height))?;
+        let here = self.api.block(self.last_height)?.ok_or_else(|| anyhow!("block {} not found", self.last_height))?;
         if !self.last_id.is_empty() && here.id != self.last_id {
             bail!(
                 "block {} changed since it was processed: the chain was reorganised deeper than network.confirmations ({}). Stopping; check your node.",
@@ -207,6 +248,7 @@ impl<'a> Engine<'a> {
                 self.cfg.confirmations
             );
         }
+        self.tip_hint = self.tip_hint.max(target + self.cfg.confirmations);
         let to = target.min(self.last_height + CHUNK);
         let ev = fetch_events(self.api, &self.me, &self.validators(), self.last_height + 1, self.last_ts, to)?;
         let r = self.apply(ev);
@@ -214,6 +256,30 @@ impl<'a> Engine<'a> {
             self.reload()?; // nothing was written: drop the half-applied in-memory state
         }
         r.map(Some)
+    }
+
+    /// Check the voters' balances after own block `height` against the node's account history
+    /// and use the node's where they differ. None when the block is outside the node's window.
+    fn verify(&mut self, height: u64) -> Result<Option<u64>> {
+        if self.tip_hint > height + HISTORY_SAFE {
+            return Ok(None);
+        }
+        let addrs: Vec<String> = self.wallets.iter().filter(|(_, w)| w.voting).map(|(a, _)| a.clone()).collect();
+        if addrs.is_empty() {
+            return Ok(Some(0));
+        }
+        let Some(node) = self.api.balances_at(&addrs, height)? else { return Ok(None) };
+        let mut fixed = 0;
+        for (a, b) in addrs.iter().zip(node) {
+            let w = self.wallets.get_mut(a).expect("tracked");
+            if w.balance != b {
+                let diff = b as i128 - w.balance as i128;
+                warn!("voter {a} at block {height}: ours {}, node {} ({}{}); using the node's", ark(w.balance), ark(b), if diff > 0 { "+" } else { "-" }, ark(diff.unsigned_abs()));
+                w.balance = b;
+                fixed += 1;
+            }
+        }
+        Ok(Some(fixed))
     }
 
     fn apply(&mut self, ev: Events) -> Result<ChunkResult> {
@@ -225,6 +291,8 @@ impl<'a> Engine<'a> {
         let mut splits: Vec<(Block, u64, alloc::BlockSplit)> = Vec::new();
         let mut due = false;
         let mut stop: Option<(u64, String, u64)> = None;
+        let (mut verified, mut corrected) = (0u64, 0u64);
+        let me = self.me.address.clone();
 
         // group everything by block timestamp
         let mut stamps: BTreeSet<u64> = BTreeSet::new();
@@ -245,10 +313,12 @@ impl<'a> Engine<'a> {
         let mut extra: Vec<Block> = Vec::new();
         let mut checked = HashSet::new();
         for t in &ev.txs {
-            if chain::vote_change(t, &self.me.public_key) == Some(true) && !self.wallets.contains_key(&t.sender) && t.sender != self.me.address && checked.insert(t.sender.clone()) {
-                if let Some(w) = self.api.wallet(&t.sender)? {
-                    if w.username.is_some() {
-                        extra.extend(self.api.forged_range(&t.sender, self.last_height + 1, ev.to.height)?);
+            for (voter, on) in chain::vote_changes(t, &me) {
+                if on && !self.wallets.contains_key(&voter) && voter != me && checked.insert(voter.clone()) {
+                    if let Some(w) = self.api.wallet(&voter)? {
+                        if w.validator {
+                            extra.extend(self.api.forged_range(&voter, self.last_height + 1, ev.to.height)?);
+                        }
                     }
                 }
             }
@@ -257,68 +327,72 @@ impl<'a> Engine<'a> {
             forged_at.entry(b.ts).or_default().push(b);
             stamps.insert(b.ts);
         }
+        {
+            let wallets = &self.wallets;
+            prefetch_refunds(self.api, &mut self.fees, ev.txs.iter(), &|a| wallets.contains_key(a) || checked.contains(a))?;
+        }
 
         for ts in stamps {
             let txs = txs_at.get(&ts).map(Vec::as_slice).unwrap_or(&[]);
-            // a wallet that starts voting for us in this block: bring it in as of the block before
-            for t in txs {
-                if chain::vote_change(t, &self.me.public_key) == Some(true) && !self.wallets.contains_key(&t.sender) {
-                    let h = own_at.get(&ts).map(|b| b.height).unwrap_or(self.last_height + 1);
-                    let w = onboard(self.api, &mut self.htlc, &self.me.public_key, &t.sender, ts, h).with_context(|| format!("bringing in new voter {}", t.sender))?;
-                    info!("new voter {} with {} ARK", t.sender, fmt_ark(w.balance as i128));
-                    self.wallets.insert(t.sender.clone(), w);
+            // a wallet that starts voting for us in this block: bring it in as of the block before,
+            // then apply the whole block to it
+            for t in txs.iter() {
+                for (voter, on) in chain::vote_changes(t, &me) {
+                    if on && !self.wallets.contains_key(&voter) {
+                        let h = own_at.get(&ts).map(|b| b.height).unwrap_or(self.last_height + 1);
+                        let w = onboard(self.api, &mut self.fees, &me, &voter, ts, h).with_context(|| format!("bringing in new voter {voter}"))?;
+                        info!("new voter {voter} with {}", ark(w.balance));
+                        self.wallets.insert(voter.clone(), w);
+                    }
                 }
             }
-            let mut look = htlc_lookup(self.api, &mut self.htlc);
             for t in txs.iter() {
-                let mut seen = HashSet::new();
+                let fees = &self.fees;
+                let mut refund = |a: &str| fees.get(a).copied().unwrap_or(0);
                 for a in chain::touched(t) {
-                    if !seen.insert(a) {
-                        continue;
-                    }
-                    if let Some(w) = self.wallets.get_mut(a) {
-                        let (b, l) = chain::delta(t, a, &mut look)?;
-                        w.balance += b;
-                        w.locked += l;
-                        if w.balance < 0 || w.locked < 0 {
+                    if let Some(w) = self.wallets.get_mut(&a) {
+                        let b = w.balance as i128 + chain::delta(t, &a, &mut refund);
+                        if b < 0 {
                             bail!("wallet {a} would go negative at transaction {}: state is out of step with the chain", t.id);
                         }
+                        w.balance = b as u128;
                     }
                 }
-                if let Some(w) = self.wallets.get_mut(&t.sender) {
-                    if let Some(v) = chain::vote_change(t, &self.me.public_key) {
-                        w.voting = v;
+                for (voter, on) in chain::vote_changes(t, &me) {
+                    if let Some(w) = self.wallets.get_mut(&voter) {
+                        w.voting = on;
                     }
-                    if t.type_group == 1 && t.tx_type == 2 {
+                }
+                for r in chain::registrations(t) {
+                    if let Some(w) = self.wallets.get_mut(&r) {
                         w.validator = true;
                     }
                 }
             }
-            drop(look);
             if let Some(list) = forged_at.get(&ts) {
                 for b in list {
-                    if let Some(w) = self.wallets.get_mut(&b.generator) {
-                        w.balance += (b.reward + b.fee) as i64;
+                    if let Some(w) = self.wallets.get_mut(&b.proposer) {
+                        w.balance += b.reward + b.fee;
                     }
                 }
             }
             if let Some(block) = own_at.get(&ts) {
-                if let Some(w) = self.wallets.get_mut(&self.me.address) {
-                    w.balance += (block.reward + block.fee) as i64; // we vote for ourselves
+                if let Some(w) = self.wallets.get_mut(&me) {
+                    w.balance += block.reward + block.fee; // we vote for ourselves
+                }
+                if let Some(n) = self.verify(block.height)? {
+                    verified += 1;
+                    corrected += n;
                 }
                 let cfg = self.cfg_at(&schedule, block.height)?;
                 let voters: Vec<VoterIn> = self
                     .wallets
                     .iter()
                     .filter(|(_, w)| w.voting)
-                    .map(|(a, w)| VoterIn {
-                        address: a.clone(),
-                        weight: (w.balance + w.locked).max(0) as u64,
-                        pending: self.accounts.get(a).map(|x| x.unpaid.max(0) as u64).unwrap_or(0),
-                    })
+                    .map(|(a, w)| VoterIn { address: a.clone(), weight: weight(w.balance), pending: self.accounts.get(a).map(|x| x.unpaid.max(0) as u64).unwrap_or(0) })
                     .collect();
-                let holder = if cfg.include_self { Some((self.me.address.as_str(), held)) } else { None };
-                let s = alloc::split(&cfg, &self.me.address, block.reward, block.fee, &voters, holder);
+                let holder = if cfg.include_self { Some((me.as_str(), held)) } else { None };
+                let s = alloc::split(&cfg, &me, units(block.reward), units(block.fee), &voters, holder);
                 for o in s.voters.iter().filter(|o| o.amount > 0) {
                     self.accounts.entry(o.address.clone()).or_insert_with(|| Account { kind: "voter".into(), ..Default::default() }).unpaid += o.amount as i64;
                 }
@@ -327,7 +401,7 @@ impl<'a> Engine<'a> {
                     acc.kind = "keep".into();
                     acc.unpaid += *amt as i64;
                 }
-                held += s.to_voters + s.keep.iter().filter(|(a, _)| *a != self.me.address).map(|k| k.1).sum::<u64>();
+                held += s.to_voters + s.keep.iter().filter(|(a, _)| *a != me).map(|k| k.1).sum::<u64>();
                 splits.push(((*block).clone(), cfg.voter_bps, s));
                 own_since += 1;
                 if every > 0 && own_since >= every {
@@ -351,8 +425,8 @@ impl<'a> Engine<'a> {
                     block.height as i64,
                     block.id,
                     block.ts as i64,
-                    block.reward as i64,
-                    block.fee as i64,
+                    units(block.reward) as i64,
+                    units(block.fee) as i64,
                     *bps as i64,
                     s.voters.iter().filter(|o| o.amount > 0).count() as i64,
                     s.total_weight as i64,
@@ -380,12 +454,13 @@ impl<'a> Engine<'a> {
         self.last_height = height;
         self.last_id = id;
         self.last_ts = ts;
-        Ok(ChunkResult { height, own_blocks: splits.len() as u64, payout_due: due })
+        Ok(ChunkResult { height, own_blocks: splits.len() as u64, verified, corrected, payout_due: due })
     }
 
-    /// Compare our voters with the node's at the node's current height and repair any wallet
-    /// that differs. Returns the number of repaired wallets, or None when the chain moved while
-    /// reading (try again later).
+    /// Compare our voters with the node: the voter list at the node's current height (votes
+    /// since our height projected from the logs), and every voter's balance at our height from
+    /// the node's account history. Repairs any wallet that differs and returns how many, or
+    /// None when the chain moved while reading or our height is outside the history window.
     pub fn reconcile(&mut self) -> Result<Option<usize>> {
         let (t1, _) = self.api.tip()?;
         let snap = self.api.voters(&self.me.address)?;
@@ -393,40 +468,31 @@ impl<'a> Engine<'a> {
         if t1 != t2 || t1 < self.last_height {
             return Ok(None);
         }
-        let mut proj: HashMap<String, (i64, bool)> = self.wallets.iter().map(|(a, w)| (a.clone(), (w.balance + w.locked, w.voting))).collect();
+        self.tip_hint = self.tip_hint.max(t1);
+        let me = self.me.address.clone();
+        let mut voting: HashMap<String, bool> = self.wallets.iter().map(|(a, w)| (a.clone(), w.voting)).collect();
         let mut new_in_window: HashSet<String> = HashSet::new();
         if t1 > self.last_height {
-            let ev = fetch_events(self.api, &self.me, &self.validators(), self.last_height + 1, self.last_ts, t1)?;
-            let mut look = htlc_lookup(self.api, &mut self.htlc);
-            for t in &ev.txs {
-                for a in chain::touched(t).into_iter().collect::<HashSet<_>>() {
-                    if let Some(p) = proj.get_mut(a) {
-                        let (b, l) = chain::delta(t, a, &mut look)?;
-                        p.0 += b + l;
-                    }
-                }
-                if let Some(v) = chain::vote_change(t, &self.me.public_key) {
-                    match proj.get_mut(&t.sender) {
-                        Some(p) => p.1 = v,
+            let end = self.api.block(t1)?.ok_or_else(|| anyhow!("block {t1} not found"))?;
+            let txs = if end.ts > self.last_ts { self.api.txs_by_time(self.last_ts + 1, end.ts)? } else { Vec::new() };
+            for t in &txs {
+                for (voter, on) in chain::vote_changes(t, &me) {
+                    match voting.get_mut(&voter) {
+                        Some(v) => *v = on,
                         None => {
-                            new_in_window.insert(t.sender.clone());
+                            new_in_window.insert(voter);
                         }
                     }
-                }
-            }
-            for b in ev.forged.iter().chain(ev.own.iter()) {
-                if let Some(p) = proj.get_mut(&b.generator) {
-                    p.0 += (b.reward + b.fee) as i64;
                 }
             }
         }
         let mut bad: BTreeSet<String> = BTreeSet::new();
         let on_node: HashSet<&str> = snap.iter().map(|w| w.address.as_str()).collect();
         for w in &snap {
-            match proj.get(&w.address) {
-                Some((bal, voting)) if *voting && *bal == (w.balance + w.locked) as i64 => {}
-                Some((bal, voting)) => {
-                    warn!("voter {} differs from the node: ours {} ARK (voting {voting}), node {} ARK", w.address, fmt_ark(*bal as i128), fmt_ark((w.balance + w.locked) as i128));
+            match voting.get(&w.address) {
+                Some(true) => {}
+                Some(false) => {
+                    warn!("{} votes for us on the node but not in our state", w.address);
                     bad.insert(w.address.clone());
                 }
                 None if new_in_window.contains(&w.address) => {}
@@ -436,70 +502,97 @@ impl<'a> Engine<'a> {
                 }
             }
         }
-        for (a, (_, voting)) in &proj {
-            if *voting && !on_node.contains(a.as_str()) {
+        for (a, v) in &voting {
+            if *v && !on_node.contains(a.as_str()) {
                 warn!("{a} votes for us in our state but not on the node");
                 bad.insert(a.clone());
             }
         }
-        if bad.is_empty() {
-            return Ok(Some(0));
-        }
-        let mut fixed = Vec::new();
+        let mut fixed: Vec<(String, WalletRow)> = Vec::new();
         for a in &bad {
-            let mut w = onboard(self.api, &mut self.htlc, &self.me.public_key, a, self.last_ts + 1, self.last_height + 1)?;
+            let mut w = onboard(self.api, &mut self.fees, &me, a, self.last_ts + 1, self.last_height + 1)?;
             if let Some(old) = self.wallets.get(a) {
                 w.first_seen = old.first_seen;
-                info!("repaired {a}: {} -> {} ARK, voting {} -> {}", fmt_ark(old.balance as i128), fmt_ark(w.balance as i128), old.voting, w.voting);
+                info!("repaired {a}: {} -> {}, voting {} -> {}", ark(old.balance), ark(w.balance), old.voting, w.voting);
             }
             fixed.push((a.clone(), w));
         }
+        // balances at our height, exactly, from the node's account history
+        let addrs: Vec<String> = self.wallets.keys().filter(|a| !bad.contains(*a)).cloned().chain(fixed.iter().map(|f| f.0.clone())).collect();
+        let exact = if addrs.is_empty() { Some(Vec::new()) } else { self.api.balances_at(&addrs, self.last_height)? };
+        let Some(exact) = exact else {
+            if !fixed.is_empty() {
+                self.save(&fixed)?;
+            }
+            return Ok(if bad.is_empty() { None } else { Some(bad.len()) });
+        };
+        let mut count = bad.len();
+        for (a, b) in addrs.iter().zip(exact) {
+            if let Some(f) = fixed.iter_mut().find(|f| f.0 == *a) {
+                f.1.balance = b;
+                continue;
+            }
+            let w = &self.wallets[a];
+            if w.balance != b {
+                warn!("wallet {a} at block {}: ours {}, node {}; using the node's", self.last_height, ark(w.balance), ark(b));
+                let mut w = w.clone();
+                w.balance = b;
+                fixed.push((a.clone(), w));
+                count += 1;
+            }
+        }
+        self.save(&fixed)?;
+        Ok(Some(count))
+    }
+
+    fn save(&mut self, fixed: &[(String, WalletRow)]) -> Result<()> {
         let tx = self.conn.transaction()?;
-        for (a, w) in &fixed {
+        for (a, w) in fixed {
             db::save_wallet(&tx, a, w)?;
         }
         tx.commit()?;
         for (a, w) in fixed {
-            self.wallets.insert(a, w);
+            self.wallets.insert(a.clone(), w.clone());
         }
-        Ok(Some(bad.len()))
+        Ok(())
     }
 }
 
 /// Initialise a fresh database at `start`: the state right after that block. Voters are read
 /// in bulk: two snapshots of the voter list around one pass over all transactions since
-/// `start` give every voter's balance at `start` without a request per voter.
+/// `start` give every voter's balance at `start` without a request per voter. Within the
+/// node's account history window the balances are then taken from the node exactly.
 pub fn initialize(cfg: &Config, api: &mut Api, conn: &mut Connection, start: Option<u64>) -> Result<u64> {
     if db::get(conn, "last_height")?.is_some() {
         bail!("database {} is already initialized", cfg.db_path().display());
     }
     let node = api.node_info()?;
-    cfg.check_network(node.pub_key_hash)?;
     let me = api.validator(&cfg.validator)?.ok_or_else(|| anyhow!("validator {} not found on {}", cfg.validator, api.base()))?;
-    let username = me.username.clone().ok_or_else(|| anyhow!("{} is not a validator", cfg.validator))?;
+    let username = me.username.clone().unwrap_or_else(|| cfg.validator.clone());
     if me.resigned {
         bail!("validator {username} has resigned");
     }
-    let pk = me.public_key.clone().ok_or_else(|| anyhow!("validator has no public key"))?;
+    let pk = me.public_key.clone().ok_or_else(|| anyhow!("validator has no public key on the chain yet"))?;
     let (tip, _) = api.tip()?;
     let safe = tip.saturating_sub(cfg.confirmations);
     let h0 = start.or(if cfg.start_height > 0 { Some(cfg.start_height) } else { None }).unwrap_or(safe);
     if h0 > safe {
         bail!("start height {h0} is above the confirmed tip {safe}");
     }
-    let b0 = api.block(&h0.to_string())?.ok_or_else(|| anyhow!("block {h0} not found"))?;
+    let b0 = api.block(h0)?.ok_or_else(|| anyhow!("block {h0} not found"))?;
     info!("initializing {username} ({}) from height {h0}, {} blocks behind the tip", me.address, tip - h0);
 
-    let mut htlc = HashMap::new();
+    let mut fees = HashMap::new();
     let mut rows: BTreeMap<String, WalletRow> = BTreeMap::new();
+    let mut consistent = false;
     for attempt in 0..6u64 {
         let snap_a = api.voters(&me.address)?;
         let (tip_now, _) = api.tip()?;
-        let head = api.block(&tip_now.to_string())?.ok_or_else(|| anyhow!("tip block not found"))?;
+        let head = api.block(tip_now)?.ok_or_else(|| anyhow!("tip block not found"))?;
         // everything since h0, up to and a little past the tip we just saw
-        let txs = api.txs_by_time(b0.ts + 1, head.ts + 3600)?;
+        let txs = api.txs_by_time(b0.ts + 1, head.ts + 3_600_000)?;
         let snap_b = api.voters(&me.address)?;
-        let key = |v: &[Wallet]| v.iter().map(|w| (w.address.clone(), w.balance, w.locked, w.produced_blocks)).collect::<BTreeSet<_>>();
+        let key = |v: &[Wallet]| v.iter().map(|w| (w.address.clone(), w.balance, w.nonce, w.last_block)).collect::<BTreeSet<_>>();
         if key(&snap_a) != key(&snap_b) {
             if attempt > 1 {
                 warn!("voters changed while reading, retrying");
@@ -508,45 +601,66 @@ pub fn initialize(cfg: &Config, api: &mut Api, conn: &mut Connection, start: Opt
             continue;
         }
         info!("read {} voters and {} transactions since height {h0}", snap_b.len(), txs.len());
-        // who was voting right after h0: first vote event since then decides, else today's vote
-        let mut first: HashMap<&str, bool> = HashMap::new();
+        // who was voting right after h0: the first vote event since then decides, else today's vote
+        let mut first: HashMap<String, bool> = HashMap::new();
         for t in &txs {
-            if let Some(v) = chain::vote_change(t, &pk) {
-                first.entry(t.sender.as_str()).or_insert(v);
+            for (voter, on) in chain::vote_changes(t, &me.address) {
+                first.entry(voter).or_insert(on);
             }
         }
-        let mut by_addr: HashMap<&str, Vec<&Tx>> = HashMap::new();
+        let mut by_addr: HashMap<String, Vec<&Tx>> = HashMap::new();
         for t in &txs {
-            for a in chain::touched(t).into_iter().collect::<HashSet<_>>() {
+            for a in chain::touched(t) {
                 by_addr.entry(a).or_default().push(t);
             }
         }
         let current: HashMap<&str, &Wallet> = snap_b.iter().map(|w| (w.address.as_str(), w)).collect();
-        let mut v0: BTreeSet<&str> = current.keys().filter(|a| !first.contains_key(*a)).copied().collect();
-        v0.extend(first.iter().filter(|(_, v)| !**v).map(|(a, _)| *a));
+        let mut v0: BTreeSet<String> = current.keys().filter(|a| !first.contains_key(**a)).map(|a| a.to_string()).collect();
+        v0.extend(first.iter().filter(|(_, v)| !**v).map(|(a, _)| a.clone()));
         info!("{} wallets voted for {username} at height {h0}", v0.len());
+        prefetch_refunds(api, &mut fees, txs.iter(), &|a| v0.contains(a))?;
         rows.clear();
-        for a in v0 {
-            let w = match current.get(a) {
+        for a in &v0 {
+            let w = match current.get(a.as_str()) {
                 Some(w) => {
-                    let forged = if w.username.is_some() { api.forged_since(a, h0 + 1)? } else { Vec::new() };
+                    let forged = if w.validator { api.forged_since(a, h0 + 1)? } else { Vec::new() };
                     let hist = by_addr.get(a).cloned().unwrap_or_default();
-                    rebuild(api, &mut htlc, &pk, w, &hist, &forged, h0 + 1)?
+                    rebuild(&fees, &me.address, w, &hist, &forged, h0 + 1)?
                 }
                 // voted for us at h0 but not any more: read it on its own
-                None => onboard(api, &mut htlc, &pk, a, b0.ts + 1, h0 + 1)?,
+                None => onboard(api, &mut fees, &me.address, a, b0.ts + 1, h0 + 1)?,
             };
             if w.voting {
-                rows.insert(a.to_string(), w);
+                rows.insert(a.clone(), w);
             }
         }
+        consistent = true;
         break;
     }
-    if rows.is_empty() && !api.voters(&me.address)?.is_empty() {
+    if !consistent {
         bail!("could not read a consistent voter list; try again");
     }
-    let total: i64 = rows.values().map(|w| w.balance + w.locked).sum();
-    info!("{} voters with {} ARK at height {h0}", rows.len(), fmt_ark(total as i128));
+    // within the node's account history: take the balances from the node itself
+    let addrs: Vec<String> = rows.keys().cloned().collect();
+    if !addrs.is_empty() {
+        match api.balances_at(&addrs, h0)? {
+            Some(exact) => {
+                let mut fixed = 0;
+                for (a, b) in addrs.iter().zip(exact) {
+                    let w = rows.get_mut(a).expect("row");
+                    if w.balance != b {
+                        warn!("voter {a} at block {h0}: rebuilt {}, node {}; using the node's", ark(w.balance), ark(b));
+                        w.balance = b;
+                        fixed += 1;
+                    }
+                }
+                info!("checked {} voter balances against the node at block {h0} ({fixed} differed)", addrs.len());
+            }
+            None => info!("block {h0} is older than the node's account history ({} blocks): balances rebuilt from the transactions", crate::api::HISTORY_BLOCKS),
+        }
+    }
+    let total: u128 = rows.values().map(|w| w.balance).sum();
+    info!("{} voters with {} at height {h0}", rows.len(), ark(total));
 
     let tx = conn.transaction()?;
     for (a, w) in &rows {
@@ -556,7 +670,7 @@ pub fn initialize(cfg: &Config, api: &mut Api, conn: &mut Connection, start: Opt
         ("username", username.clone()),
         ("validator_address", me.address.clone()),
         ("validator_public_key", pk.clone()),
-        ("network", node.pub_key_hash.to_string()),
+        ("chain_id", node.chain_id.to_string()),
         ("nethash", node.nethash.clone()),
         ("start_height", h0.to_string()),
         ("last_height", h0.to_string()),

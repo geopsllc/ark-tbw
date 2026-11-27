@@ -28,19 +28,28 @@ struct Raw {
 struct RawNetwork {
     api: String,
     #[serde(default)]
+    rpc: Option<String>,
+    #[serde(default)]
+    tx_api: Option<String>,
+    #[serde(default)]
     broadcast: Vec<String>,
     #[serde(default)]
     requests_per_minute: u32,
+    #[serde(default = "default_rpc_rate")]
+    rpc_requests_per_minute: u32,
     #[serde(default = "default_confirmations")]
     confirmations: u64,
     #[serde(default = "default_poll")]
     poll_seconds: u64,
 }
 fn default_confirmations() -> u64 {
-    10
+    3
 }
 fn default_poll() -> u64 {
-    20
+    15
+}
+fn default_rpc_rate() -> u32 {
+    120
 }
 
 #[derive(Deserialize)]
@@ -103,6 +112,9 @@ struct RawPayout {
     multipayment: bool,
     #[serde(default)]
     max_fee: Option<toml::Value>,
+    /// gwei; default: the network minimum
+    #[serde(default)]
+    gas_price: Option<toml::Value>,
     #[serde(default)]
     secret_file: Option<String>,
 }
@@ -134,8 +146,11 @@ pub struct Keep {
 pub struct Config {
     pub path: PathBuf,
     pub api: String,
+    pub rpc: String,
+    pub tx_api: String,
     pub broadcast: Vec<String>,
     pub requests_per_minute: u32,
+    pub rpc_requests_per_minute: u32,
     pub confirmations: u64,
     pub poll_seconds: u64,
 
@@ -163,7 +178,10 @@ pub struct Config {
     pub min_amount: u64,
     pub memo: String,
     pub multipayment: bool,
+    /// highest fee one transaction may cost (units of 1e-8 ARK)
     pub max_fee: u64,
+    /// wei per gas; 0 = the network minimum
+    pub gas_price: u128,
     pub secret_file: PathBuf,
 
     pub data_dir: PathBuf,
@@ -221,6 +239,17 @@ pub fn fmt_ark(arktoshi: i128) -> String {
     s.trim_end_matches('.').to_string()
 }
 
+/// Name of the coin in messages: "TARK" on the Mainsail testnet (chain id 11812), else "ARK".
+static SYMBOL: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+pub fn set_chain(chain_id: u64) {
+    let _ = SYMBOL.set(if chain_id == 11812 { "TARK" } else { "ARK" });
+}
+
+pub fn sym() -> &'static str {
+    SYMBOL.get().copied().unwrap_or("ARK")
+}
+
 pub fn fmt_pct(bps: u64) -> String {
     if bps % 100 == 0 {
         format!("{}%", bps / 100)
@@ -229,18 +258,14 @@ pub fn fmt_pct(bps: u64) -> String {
     }
 }
 
+/// A 0x address in checksum case. Mixed case must match its EIP-55 checksum (catches typos).
 fn check_address(a: &str, what: &str) -> Result<String> {
     let a = a.trim();
-    let raw = bs58::decode(a).with_check(None).into_vec().map_err(|_| anyhow!("{what}: {a:?} is not a valid address"))?;
-    if raw.len() != 21 {
-        bail!("{what}: {a:?} is not a valid address");
+    match crate::evm::parse_address(a) {
+        Ok(raw) => Ok(crate::evm::checksum(&raw)),
+        Err(e) if a.starts_with('A') || a.starts_with('D') => bail!("{what}: {a:?} is an ARK Core v3 address; Mainsail uses 0x addresses ({e})"),
+        Err(e) => bail!("{what}: {a:?} is not a valid 0x address: {e}"),
     }
-    Ok(a.to_string())
-}
-
-/// Network byte of an address (23 = mainnet "A", 30 = devnet "D").
-pub fn address_network(a: &str) -> Option<u8> {
-    bs58::decode(a).with_check(None).into_vec().ok().filter(|v| v.len() == 21).map(|v| v[0])
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -271,10 +296,26 @@ impl Config {
         if !(api.starts_with("http://") || api.starts_with("https://")) {
             bail!("network.api must start with http:// or https://");
         }
+        let defaults = crate::api::default_urls(&api);
+        let url = |v: &Option<String>, i: usize, what: &str| -> Result<String> {
+            let u = match v {
+                Some(u) => u.trim().trim_end_matches('/').to_string(),
+                None => match &defaults {
+                    Some(d) => if i == 0 { d.0.clone() } else { d.1.clone() },
+                    None => bail!("set network.{what}: it cannot be derived from network.api"),
+                },
+            };
+            if !(u.starts_with("http://") || u.starts_with("https://")) {
+                bail!("network.{what} must start with http:// or https://");
+            }
+            Ok(u)
+        };
+        let rpc = url(&raw.network.rpc, 0, "rpc")?;
+        let tx_api = url(&raw.network.tx_api, 1, "tx_api")?;
         let broadcast: Vec<String> = raw.network.broadcast.iter().map(|s| s.trim().trim_end_matches('/').to_string()).collect();
         for b in &broadcast {
             if !(b.starts_with("http://") || b.starts_with("https://")) {
-                bail!("network.broadcast entries must start with http:// or https://");
+                bail!("network.broadcast entries (transaction pool APIs) must start with http:// or https://");
             }
         }
         if raw.network.confirmations == 0 || raw.network.confirmations > 1000 {
@@ -334,17 +375,6 @@ impl Config {
             }
         }
 
-        // all addresses on one network
-        let mut nets = BTreeSet::new();
-        for a in blacklist.iter().chain(&whitelist).chain(custom.keys()).chain(keep.iter().map(|k| &k.address).filter(|a| !a.is_empty())).chain(redirect.keys()).chain(redirect.values()) {
-            if let Some(n) = address_network(a) {
-                nets.insert(n);
-            }
-        }
-        if nets.len() > 1 {
-            bail!("the config mixes addresses from different networks");
-        }
-
         // payout
         let p = &raw.payout;
         let mut at = Vec::new();
@@ -359,7 +389,7 @@ impl Config {
         at.sort();
         at.dedup();
         if p.every_blocks == 0 && at.is_empty() {
-            bail!("set payout.every_blocks (own forged blocks between payouts) and/or payout.at (UTC times)");
+            bail!("set payout.every_blocks (own proposed blocks between payouts) and/or payout.at (UTC times)");
         }
         if p.memo.trim().len() > 255 || keep.iter().any(|k| k.memo.trim().len() > 255) {
             bail!("memos are limited to 255 bytes");
@@ -370,11 +400,15 @@ impl Config {
         };
         let max_fee = match &p.max_fee {
             Some(v) => parse_ark(v).context("payout.max_fee")?,
-            None => ARKTOSHI / 2,
+            None => ARKTOSHI / 10,
         };
         if max_fee == 0 {
             bail!("payout.max_fee must be above zero");
         }
+        let gas_price = match &p.gas_price {
+            Some(v) => parse_decimal(&toml_num(v)?, 9).context("payout.gas_price (gwei, up to 9 decimals)")? as u128,
+            None => 0,
+        };
         let secret_file = resolve(p.secret_file.as_deref().unwrap_or("secret.toml"));
 
         let data_dir = resolve(raw.storage.data_dir.as_deref().unwrap_or("."));
@@ -382,8 +416,11 @@ impl Config {
         Ok(Config {
             path: path.to_path_buf(),
             api,
+            rpc,
+            tx_api,
             broadcast,
             requests_per_minute: raw.network.requests_per_minute,
+            rpc_requests_per_minute: raw.network.rpc_requests_per_minute,
             confirmations: raw.network.confirmations,
             poll_seconds: raw.network.poll_seconds,
             validator: raw.validator.name.trim().to_string(),
@@ -407,6 +444,7 @@ impl Config {
             memo: p.memo.trim().to_string(),
             multipayment: p.multipayment,
             max_fee,
+            gas_price,
             secret_file,
             data_dir,
         })
@@ -455,15 +493,15 @@ impl Config {
         Ok(c)
     }
 
-    /// Check every configured address against the network byte reported by the node.
-    pub fn check_network(&self, pub_key_hash: u8) -> Result<()> {
-        for a in self.blacklist.iter().chain(&self.whitelist).chain(self.custom.keys()).chain(self.keep.iter().map(|k| &k.address).filter(|a| !a.is_empty())).chain(self.redirect.keys()).chain(self.redirect.values()) {
-            if address_network(a) != Some(pub_key_hash) {
-                bail!("address {a} in the config does not belong to the node's network");
-            }
-        }
-        Ok(())
-    }
+}
+
+fn toml_num(v: &toml::Value) -> Result<String> {
+    Ok(match v {
+        toml::Value::String(s) => s.trim().to_string(),
+        toml::Value::Integer(i) if *i >= 0 => i.to_string(),
+        toml::Value::Float(f) if *f >= 0.0 && f.is_finite() => format!("{f}"),
+        _ => bail!("not a non-negative number: {v}"),
+    })
 }
 
 /// Secret file: `passphrase = "..."` and optionally `second_passphrase = "..."`.
@@ -566,11 +604,11 @@ memo = "pool"
         let mut c = parse(BASE).unwrap();
         assert_eq!(c.keep[0].bps, 5000);
         assert_eq!(c.keep[0].address, "");
-        c.bind_validator("AU1TGCYoWzBnGMyMK9GTS8BG6EFbgc5xxC");
-        assert_eq!(c.main_keep(), "AU1TGCYoWzBnGMyMK9GTS8BG6EFbgc5xxC");
-        let c = parse(&BASE.replace("percent = 50", "percent = 85.5\nkeep_address = \"AKdr5d9AMEnsKYxpDcoHdyyjSCKVx3r9Nj\"")).unwrap();
+        c.bind_validator("0x7783464d965A1E6a13B19b8222C56C53d32414ad");
+        assert_eq!(c.main_keep(), "0x7783464d965A1E6a13B19b8222C56C53d32414ad");
+        let c = parse(&BASE.replace("percent = 50", "percent = 85.5\nkeep_address = \"0x6F0182a0cc707b055322CcF6d4CB6a5Aff1aEb22\"")).unwrap();
         assert_eq!(c.keep[0].bps, 1450);
-        assert_eq!(c.main_keep(), "AKdr5d9AMEnsKYxpDcoHdyyjSCKVx3r9Nj");
+        assert_eq!(c.main_keep(), "0x6F0182a0cc707b055322CcF6d4CB6a5Aff1aEb22");
         let c2 = c.with_voter_bps(9000).unwrap();
         assert_eq!(c2.keep[0].bps, 1000);
         assert!(c.with_voter_bps(10001).is_err());
@@ -580,14 +618,22 @@ memo = "pool"
     fn rejects_bad_settings() {
         assert!(parse(&BASE.replace("every_blocks = 211", "")).is_err());
         assert!(parse(&BASE.replace("max_vote = \"200000\"", "max_vote = 5")).is_err());
-        assert!(parse(&format!("{BASE}\n[redirect]\nAU1TGCYoWzBnGMyMK9GTS8BG6EFbgc5xxC = \"AKdr5d9AMEnsKYxpDcoHdyyjSCKVx3r9Nj\"\nAKdr5d9AMEnsKYxpDcoHdyyjSCKVx3r9Nj = \"AKfpFjpqUAGTjuAcwfQnVNuY7Z3tKz1RFy\"\n")).is_err());
+        assert!(parse(&format!("{BASE}\n[redirect]\n0x7783464d965A1E6a13B19b8222C56C53d32414ad = \"0x6F0182a0cc707b055322CcF6d4CB6a5Aff1aEb22\"\n0x6F0182a0cc707b055322CcF6d4CB6a5Aff1aEb22 = \"0xC3bBE9B1CeE1ff85Ad72b87414B0E9B7F2366763\"\n")).is_err());
         assert!(parse(&BASE.replace("[share]", "[share]\nbogus = 1")).is_err());
         // custom rates up to 100% are fine (the keep absorbs the difference), above is not
-        let c = BASE.replace("max_vote = \"200000\"", "max_vote = \"200000\"\n[share.custom]\nAKdr5d9AMEnsKYxpDcoHdyyjSCKVx3r9Nj = 100");
+        let c = BASE.replace("max_vote = \"200000\"", "max_vote = \"200000\"\n[share.custom]\n0x6F0182a0cc707b055322CcF6d4CB6a5Aff1aEb22 = 100");
         assert!(parse(&c).is_ok());
         assert!(parse(&c.replace("= 100", "= 101")).is_err());
-        // mixed networks
-        assert!(parse(&format!("{BASE}\n[redirect]\nAU1TGCYoWzBnGMyMK9GTS8BG6EFbgc5xxC = \"D61mfSggzbvQgTUe6JhYKH2doHaqJ3Dyib\"\n")).is_err());
-        assert!(parse(&BASE.replace("[payout]", "[[keep]]\naddress = \"AU1TGCYoWzBnGMyMK9GTS8BG6EFbgc5xxC\"\n[payout]")).is_err());
+        // ARK Core addresses and mistyped checksums are refused; all lowercase is fine
+        assert!(parse(&format!("{BASE}\n[redirect]\n0x7783464d965A1E6a13B19b8222C56C53d32414ad = \"D61mfSggzbvQgTUe6JhYKH2doHaqJ3Dyib\"\n")).is_err());
+        assert!(parse(&format!("{BASE}\n[redirect]\n0x7783464d965A1E6a13B19b8222C56C53d32414ad = \"0x6f0182a0cc707b055322CcF6d4CB6a5Aff1aEb22\"\n")).is_err());
+        let c = parse(&format!("{BASE}\n[redirect]\n0x7783464d965a1e6a13b19b8222c56c53d32414ad = \"0x6f0182a0cc707b055322ccf6d4cb6a5aff1aeb22\"\n")).unwrap();
+        assert_eq!(c.redirect.get("0x7783464d965A1E6a13B19b8222C56C53d32414ad").map(String::as_str), Some("0x6F0182a0cc707b055322CcF6d4CB6a5Aff1aEb22"));
+        // RPC and pool URLs follow the API URL; gas price in gwei
+        let c = parse(&BASE.replace("[payout]", "[payout]\ngas_price = 7.5")).unwrap();
+        assert_eq!(c.rpc, "http://127.0.0.1:4008/api");
+        assert_eq!(c.tx_api, "http://127.0.0.1:4007/api");
+        assert_eq!(c.gas_price, 7_500_000_000);
+        assert!(parse(&BASE.replace("[payout]", "[[keep]]\naddress = \"0x7783464d965A1E6a13B19b8222C56C53d32414ad\"\n[payout]")).is_err());
     }
 }

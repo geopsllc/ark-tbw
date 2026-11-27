@@ -14,7 +14,7 @@ for v in 22.04 24.04 26.04; do
       apt-get update -qq >/dev/null && apt-get install -y -qq systemd ca-certificates >/dev/null 2>&1
       useradd -m tbw
       ark-tbw --version
-      su tbw -c "mkdir -p ~/.ark-tbw && cd ~/.ark-tbw && sed \"s|http://127.0.0.1:4003/api|https://api.ark.io/api|;s|requests_per_minute = 0|requests_per_minute = 60|;s|name = \\\"myvalidator\\\"|name = \\\"geops\\\"|;s|enabled = true|enabled = false|\" /cfg/config.example.toml > config.toml && printf \"passphrase = \\\"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about\\\"\n\" > secret.toml && chmod 600 secret.toml"
+      su tbw -c "mkdir -p ~/.ark-tbw && cd ~/.ark-tbw && sed \"s|http://127.0.0.1:4003/api|https://testnet.mainsailhq.com/api|;s|name = \\\"myvalidator\\\"|name = \\\"geop5\\\"|;s|enabled = true|enabled = false|\" /cfg/config.example.toml > config.toml && printf \"passphrase = \\\"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about\\\"\n\" > secret.toml && chmod 600 secret.toml"
       su tbw -c "ark-tbw --config ~/.ark-tbw/config.toml init" | tail -2
       su tbw -c "ark-tbw --config ~/.ark-tbw/config.toml status"
       su tbw -c "ark-tbw --config ~/.ark-tbw/config.toml check" 2>&1 | tail -3 || true

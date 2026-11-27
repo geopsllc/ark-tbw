@@ -1,4 +1,4 @@
-//! Splitting one forged block between voters and the keep. Pure integer arithmetic:
+//! Splitting one proposed block between voters and the keep. Pure integer arithmetic:
 //! the parts always add up to exactly reward + fee, and the keep takes the rounding dust.
 
 use crate::config::{Config, Ineligible, BPS};
@@ -6,7 +6,7 @@ use crate::config::{Config, Ineligible, BPS};
 #[derive(Clone, Debug)]
 pub struct VoterIn {
     pub address: String,
-    /// Voting weight as Core counts it (balance + HTLC-locked balance), in arktoshi.
+    /// Voting weight: the balance in units of 1e-8 ARK (wei / 1e10), as the consensus contract counts it.
     pub weight: u64,
     /// Rewards owed to this voter and not paid out yet (used for anti-dilution).
     pub pending: u64,
@@ -111,11 +111,12 @@ mod tests {
     use crate::config::{Config, ARKTOSHI};
     use std::path::Path;
 
-    const D: &str = "AU1TGCYoWzBnGMyMK9GTS8BG6EFbgc5xxC"; // validator + main_keep
-    const A: &str = "AKdr5d9AMEnsKYxpDcoHdyyjSCKVx3r9Nj";
-    const B: &str = "AKfpFjpqUAGTjuAcwfQnVNuY7Z3tKz1RFy";
-    const C: &str = "ANcUgCY6ubwNCXXnnBPdz4ceH3FYtCUeE1";
-    const K: &str = "AMvXMDJorQpRqXXErDqKEfEAdjsoaYeeYW";
+    const D: &str = "0x7783464d965A1E6a13B19b8222C56C53d32414ad"; // validator + main_keep
+    const A: &str = "0x6F0182a0cc707b055322CcF6d4CB6a5Aff1aEb22";
+    const B: &str = "0xC3bBE9B1CeE1ff85Ad72b87414B0E9B7F2366763";
+    const C: &str = "0xe5a97E663158dEaF3b65bBF88897b8359Dc19F81";
+    #[allow(dead_code)]
+    const K: &str = "0x00EFd0D4639191C49908A7BddbB9A11A994A8527";
 
     fn cfg(extra_share: &str, keep: &str) -> Config {
         let t = format!(

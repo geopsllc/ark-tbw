@@ -4,17 +4,16 @@ mod chain;
 mod config;
 mod crypto;
 mod db;
-mod import;
+mod evm;
 mod log;
 mod payout;
 mod service;
 mod sync;
-mod tx;
 
 use anyhow::{anyhow, bail, Context, Result};
 use api::{Api, NodeInfo};
 use clap::{Parser, Subcommand};
-use config::{fmt_ark, fmt_pct, Config, BPS};
+use config::{fmt_ark, fmt_pct, sym, Config, BPS};
 use rusqlite::{params, Connection};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +22,7 @@ use std::time::{Duration, Instant};
 use sync::{Engine, Me};
 
 #[derive(Parser)]
-#[command(name = "ark-tbw", version, about = "True block weight reward sharing for ARK Core v3 validators")]
+#[command(name = "ark-tbw", version, about = "True block weight reward sharing for ARK Mainsail validators")]
 struct Cli {
     /// Config file
     #[arg(short, long, global = true, env = "ARK_TBW_CONFIG")]
@@ -39,9 +38,6 @@ enum Cmd {
         /// Start right after this block (default: validator.start_height, else the confirmed tip)
         #[arg(long)]
         from_height: Option<u64>,
-        /// Carry over unpaid balances and the last processed block from a core3-tbw tbw.db
-        #[arg(long)]
-        import_core3: Option<PathBuf>,
     },
     /// Run the service in the foreground (systemd runs this)
     Run,
@@ -75,6 +71,10 @@ enum Cmd {
     PayNow,
     /// Cancel a stuck payout (consumes its nonces; nothing can be paid twice)
     CancelPayout { id: i64 },
+    /// Recipients that cannot be paid through the multipayment contract, or not at all
+    Payees,
+    /// Try paying a blocked or direct-only recipient through the multipayment again
+    Unblock { address: String },
     /// Show the service log (journald)
     Logs {
         /// Follow new lines
@@ -153,7 +153,7 @@ fn real_main(cli: Cli) -> Result<()> {
     }
     let cfg = load_config(&cli)?;
     match &cli.cmd {
-        Cmd::Init { from_height, import_core3 } => cmd_init(&cfg, *from_height, import_core3.as_deref()),
+        Cmd::Init { from_height } => cmd_init(&cfg, *from_height),
         Cmd::Run => cmd_run(&cli, cfg),
         Cmd::Check => cmd_check(&cfg),
         Cmd::Status => cmd_status(&cfg),
@@ -163,6 +163,8 @@ fn real_main(cli: Cli) -> Result<()> {
         Cmd::Share { action } => cmd_share(&cfg, action.as_ref()),
         Cmd::PayNow => queue(&cfg, "pay-now", None),
         Cmd::CancelPayout { id } => queue(&cfg, "cancel-payout", Some(id.to_string())),
+        Cmd::Payees => cmd_payees(&cfg),
+        Cmd::Unblock { address } => cmd_unblock(&cfg, address),
         _ => unreachable!(),
     }
 }
@@ -172,20 +174,28 @@ fn open_db(cfg: &Config) -> Result<Connection> {
     if !p.exists() {
         bail!("no database at {}: run  ark-tbw init", p.display());
     }
-    db::open(&p)
+    let c = db::open(&p)?;
+    if let Some(id) = db::get_u64(&c, "chain_id")? {
+        config::set_chain(id);
+    }
+    Ok(c)
 }
 
-fn signer_for(cfg: &Config, me: &Me, api: &mut Api) -> Result<tx::Signer> {
+fn api_for(cfg: &Config) -> Api {
+    Api::new(&cfg.api, &cfg.rpc, &cfg.tx_api, cfg.requests_per_minute, cfg.rpc_requests_per_minute)
+}
+
+fn signer_for(cfg: &Config, me: &Me, api: &mut Api) -> Result<payout::Signer> {
     let secret = config::load_secret(cfg)?;
     let keys = crypto::KeyPair::from_passphrase(secret.passphrase.trim()).map_err(|e| anyhow!(e))?;
-    if keys.public_hex() != me.public_key {
+    if keys.public_hex() != me.public_key.trim_start_matches("0x").to_lowercase() || evm::address_from_public_key(&keys.public).ok().as_deref() != Some(me.address.as_str()) {
         bail!(Fatal("the passphrase in the secret file does not belong to the validator wallet".into()));
     }
     let w = api.wallet(&me.address)?.ok_or_else(|| anyhow!("validator wallet not found"))?;
     let second = match (&w.second_public_key, &secret.second_passphrase) {
         (Some(spk), Some(p)) => {
             let k = crypto::KeyPair::from_passphrase(p.trim()).map_err(|e| anyhow!(e))?;
-            if &k.public_hex() != spk {
+            if k.public_hex() != spk.trim_start_matches("0x").to_lowercase() {
                 bail!(Fatal("second_passphrase in the secret file is not the wallet's second passphrase".into()));
             }
             Some(k)
@@ -197,52 +207,47 @@ fn signer_for(cfg: &Config, me: &Me, api: &mut Api) -> Result<tx::Signer> {
     if crypto::looks_like_secret(&cfg.memo, &[&keys.public]) || cfg.keep.iter().any(|k| crypto::looks_like_secret(&k.memo, &[&keys.public])) {
         bail!(Fatal("a payout memo looks like a passphrase; memos are public".into()));
     }
-    Ok(tx::Signer { keys, second, network: me.network })
+    payout::Signer::new(keys, second, me.chain_id)
 }
 
-fn cmd_init(cfg: &Config, from: Option<u64>, core3: Option<&std::path::Path>) -> Result<()> {
+fn cmd_init(cfg: &Config, from: Option<u64>) -> Result<()> {
     let _lock = db::lock(&cfg.data_dir)?;
     let mut conn = db::open(&cfg.db_path())?;
-    let mut api = Api::new(&cfg.api, cfg.requests_per_minute);
-    let imported = match core3 {
-        Some(p) => Some(import::read_core3(p)?),
-        None => None,
-    };
-    let start = match (&imported, from) {
-        (Some(i), Some(f)) if f != i.last_height => bail!("--from-height {f} differs from the last block core3-tbw processed ({})", i.last_height),
-        (Some(i), _) => Some(i.last_height),
-        (None, f) => f,
-    };
-    let h0 = sync::initialize(cfg, &mut api, &mut conn, start)?;
-    if let Some(i) = imported {
-        let mut c = cfg.clone();
-        c.bind_validator(&Me::load(&conn)?.address);
-        import::apply(&conn, &c, &i)?;
-    }
-    info!("initialized at height {h0} with {} API requests. Next: ark-tbw check, then start the service", api.requests);
+    let mut api = api_for(cfg);
+    config::set_chain(api.chain_id()?);
+    let h0 = sync::initialize(cfg, &mut api, &mut conn, from)?;
+    info!("initialized at height {h0} with {} API and {} RPC requests. Next: ark-tbw check, then start the service", api.requests, api.rpc_requests);
     Ok(())
 }
 
 fn cmd_check(cfg: &Config) -> Result<()> {
-    let mut api = Api::new(&cfg.api, cfg.requests_per_minute);
+    let mut api = api_for(cfg);
     let node = api.node_info()?;
-    cfg.check_network(node.pub_key_hash)?;
+    config::set_chain(node.chain_id);
     let (tip, _) = api.tip()?;
     println!("config      {} OK", cfg.path.display());
-    println!("node        {} at height {tip} (network {})", cfg.api, node.pub_key_hash);
+    println!("node        {} at height {tip} (chain id {}, {})", cfg.api, node.chain_id, sym());
     let d = api.validator(&cfg.validator)?.ok_or_else(|| anyhow!("validator {} not found", cfg.validator))?;
-    println!("validator   {} {}", d.username.as_deref().unwrap_or("?"), d.address);
+    println!("validator   {} {}{}", d.username.as_deref().unwrap_or("(no username)"), d.address, if d.resigned { "  RESIGNED" } else { "" });
+    match api.balances_at(std::slice::from_ref(&d.address), tip.saturating_sub(cfg.confirmations)) {
+        Ok(Some(_)) => println!("rpc         {} OK (account history of the last {} blocks)", cfg.rpc, api::HISTORY_BLOCKS),
+        Ok(None) => println!("rpc         {} answers, but without account history at height {}", cfg.rpc, tip.saturating_sub(cfg.confirmations)),
+        Err(e) => println!("rpc         {} UNREACHABLE: {e:#}", cfg.rpc),
+    }
+    let gas = payout::Gas::new(cfg, &node);
+    println!("gas         price {} gwei (network minimum {}), up to {} gas per transaction", gas.price as f64 / 1e9, node.min_gas_price as f64 / 1e9, gas.max);
     println!(
         "split       share {} to voters, keep {} to {}",
         fmt_pct(cfg.voter_bps),
         fmt_pct(cfg.keep[0].bps),
         if cfg.keep[0].address.is_empty() { "the validator wallet" } else { cfg.keep[0].address.as_str() }
     );
-    for b in &cfg.broadcast {
-        let mut a = Api::new(b, 0);
-        match a.tip() {
-            Ok((h, _)) => println!("broadcast   {b} at height {h}"),
-            Err(e) => println!("broadcast   {b} UNREACHABLE: {e:#}"),
+    for b in std::iter::once(&cfg.tx_api).chain(&cfg.broadcast) {
+        let mut a = Api::new(b, &cfg.rpc, b, 0, 0);
+        match a.get_opt(&format!("{b}/transactions/unconfirmed?limit=1")) {
+            Ok(Some(_)) => println!("tx pool     {b} OK"),
+            Ok(None) => println!("tx pool     {b} NOT FOUND"),
+            Err(e) => println!("tx pool     {b} UNREACHABLE: {e:#}"),
         }
     }
     if cfg.payout_enabled {
@@ -250,11 +255,11 @@ fn cmd_check(cfg: &Config) -> Result<()> {
             username: d.username.clone().unwrap_or_default(),
             address: d.address.clone(),
             public_key: d.public_key.clone().unwrap_or_default(),
-            network: node.pub_key_hash,
+            chain_id: node.chain_id,
         };
         let s = signer_for(cfg, &me, &mut api)?;
-        println!("secret      OK (signs as {}{})", s.address(), if s.second.is_some() { ", with second passphrase" } else { "" });
-        println!("balance     {} ARK", fmt_ark(d.balance as i128));
+        println!("secret      OK (signs as {}{})", s.address, if s.second.is_some() { ", with second passphrase" } else { "" });
+        println!("balance     {} (next nonce {})", sync::ark(d.balance), d.nonce);
     } else {
         println!("payouts     SHADOW mode: payouts are computed and recorded, nothing is sent");
     }
@@ -315,7 +320,7 @@ fn cmd_status(cfg: &Config) -> Result<()> {
     let lp = db::get_u64(&conn, "last_payout_height")?.unwrap_or(0);
     let own: i64 = conn.query_row("SELECT COUNT(*) FROM blocks", [], |r| r.get(0))?;
     let own_since: i64 = conn.query_row("SELECT COUNT(*) FROM blocks WHERE height > ?1", params![lp as i64], |r| r.get(0))?;
-    let mut api = Api::new(&cfg.api, cfg.requests_per_minute);
+    let mut api = api_for(cfg);
     let tip = api.tip().map(|t| t.0).ok();
     println!("validator    {} {}", me.username, me.address);
     println!("service      {}", if db::is_locked(&cfg.data_dir) { "running" } else { "not running" });
@@ -339,9 +344,13 @@ fn cmd_status(cfg: &Config) -> Result<()> {
         [],
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
-    println!("unpaid       voters {} ARK, keep {} ARK", fmt_ark(vu as i128), fmt_ark(ku as i128));
+    println!("unpaid       voters {} {s}, keep {} {s}", fmt_ark(vu as i128), fmt_ark(ku as i128), s = sym());
     let voting: i64 = conn.query_row("SELECT COUNT(*) FROM wallets WHERE voting=1", [], |r| r.get(0))?;
     println!("voters       {voting}");
+    let blocked: i64 = conn.query_row("SELECT COUNT(*) FROM payees WHERE mode='blocked'", [], |r| r.get(0))?;
+    if blocked > 0 {
+        println!("BLOCKED      {blocked} recipient(s) cannot be paid: see  ark-tbw payees");
+    }
     if let Some(id) = payout::pending_payout(&conn)? {
         println!("IN PROGRESS  payout #{id}: see  ark-tbw payouts {id}");
     }
@@ -353,14 +362,18 @@ fn cmd_status(cfg: &Config) -> Result<()> {
 fn cmd_voters(cfg: &Config, all: bool) -> Result<()> {
     let conn = open_db(cfg)?;
     let mut st = conn.prepare(
-        "SELECT w.address, w.balance + w.locked, w.voting, COALESCE(a.unpaid,0), COALESCE(a.paid,0)
-         FROM wallets w LEFT JOIN accounts a ON a.address = w.address
-         WHERE ?1 OR w.voting = 1 ORDER BY w.balance + w.locked DESC",
+        "SELECT w.address, w.balance, w.voting, COALESCE(a.unpaid,0), COALESCE(a.paid,0)
+         FROM wallets w LEFT JOIN accounts a ON a.address = w.address WHERE ?1 OR w.voting = 1",
     )?;
-    let rows = st.query_map(params![all], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)))?;
-    println!("{:<36} {:>18} {:>14} {:>14}  note", "address", "weight ARK", "unpaid ARK", "paid ARK");
-    for r in rows {
-        let (a, w, v, u, p) = r?;
+    let mut rows: Vec<(String, u64, i64, i64, i64)> = st
+        .query_map(params![all], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)))?
+        .map(|r| r.map(|(a, b, v, u, p)| (a, sync::weight(b.parse().unwrap_or(0)), v, u, p)))
+        .collect::<rusqlite::Result<_>>()?;
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let payees = db::payees(&conn)?;
+    let s = sym();
+    println!("{:<42} {:>18} {:>14} {:>14}  note", "address", format!("weight {s}"), format!("unpaid {s}"), format!("paid {s}"));
+    for (a, w, v, u, p) in rows {
         let mut note = Vec::new();
         if v == 0 {
             note.push("not voting".to_string());
@@ -371,10 +384,10 @@ fn cmd_voters(cfg: &Config, all: bool) -> Result<()> {
         if !cfg.whitelist.is_empty() && !cfg.whitelist.contains(&a) {
             note.push("not whitelisted".into());
         }
-        if (w as u64) < cfg.min_vote {
+        if w < cfg.min_vote {
             note.push("below minimum".into());
         }
-        if cfg.max_vote > 0 && w as u64 > cfg.max_vote {
+        if cfg.max_vote > 0 && w > cfg.max_vote {
             note.push("capped".into());
         }
         if let Some(c) = cfg.custom.get(&a) {
@@ -383,7 +396,41 @@ fn cmd_voters(cfg: &Config, all: bool) -> Result<()> {
         if let Some(t) = cfg.redirect.get(&a) {
             note.push(format!("paid to {t}"));
         }
-        println!("{:<36} {:>18} {:>14} {:>14}  {}", a, fmt_ark(w as i128), fmt_ark(u as i128), fmt_ark(p as i128), note.join(", "));
+        match payees.get(cfg.payee(&a)).map(String::as_str) {
+            Some("blocked") => note.push("BLOCKED: payments fail, set a redirect".into()),
+            Some("direct") => note.push("paid by own transfer".into()),
+            _ => {}
+        }
+        println!("{:<42} {:>18} {:>14} {:>14}  {}", a, fmt_ark(w as i128), fmt_ark(u as i128), fmt_ark(p as i128), note.join(", "));
+    }
+    Ok(())
+}
+
+fn cmd_payees(cfg: &Config) -> Result<()> {
+    let conn = open_db(cfg)?;
+    let mut st = conn.prepare("SELECT address, mode, reason, at FROM payees ORDER BY mode, address")?;
+    let rows: Vec<(String, String, String, i64)> = st.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?.collect::<rusqlite::Result<_>>()?;
+    if rows.is_empty() {
+        println!("every recipient so far could be paid through the multipayment contract");
+        return Ok(());
+    }
+    for (a, mode, reason, at) in rows {
+        let t = chrono::DateTime::from_timestamp(at, 0).map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
+        let what = if mode == "blocked" { "BLOCKED (skipped; set a [redirect] for the voter)" } else { "paid by its own transfer" };
+        println!("{a}  {what}  since {t}: {reason}");
+    }
+    println!("ark-tbw unblock <address> tries the multipayment for it again");
+    Ok(())
+}
+
+fn cmd_unblock(cfg: &Config, address: &str) -> Result<()> {
+    let conn = open_db(cfg)?;
+    let a = evm::norm(address).ok_or_else(|| anyhow!("{address:?} is not a 0x address"))?;
+    let n = conn.execute("DELETE FROM payees WHERE address=?1", params![a])?;
+    if n == 0 {
+        println!("{a} was not blocked");
+    } else {
+        println!("{a} goes back to normal payments from the next payout");
     }
     Ok(())
 }
@@ -392,10 +439,10 @@ fn cmd_blocks(cfg: &Config, limit: usize) -> Result<()> {
     let conn = open_db(cfg)?;
     let mut st = conn.prepare("SELECT height, ts, reward + fee, voter_bps, voters, to_voters, to_keep FROM blocks ORDER BY height DESC LIMIT ?1")?;
     let rows = st.query_map(params![limit as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?)))?;
-    println!("{:>10}  {:<20} {:>12} {:>7} {:>6} {:>14} {:>14}", "height", "time (UTC)", "forged", "share", "paid", "to voters", "to keep");
+    println!("{:>10}  {:<20} {:>12} {:>7} {:>6} {:>14} {:>14}", "height", "time (UTC)", "proposed", "share", "paid", "to voters", "to keep");
     for r in rows {
         let (h, ts, total, bps, n, v, res) = r?;
-        let t = chrono::DateTime::from_timestamp(ts + 1_490_101_200, 0).map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
+        let t = chrono::DateTime::from_timestamp_millis(ts).map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
         println!("{h:>10}  {t:<20} {:>12} {:>7} {n:>6} {:>14} {:>14}", fmt_ark(total as i128), fmt_pct(bps as u64), fmt_ark(v as i128), fmt_ark(res as i128));
     }
     Ok(())
@@ -412,7 +459,7 @@ fn cmd_payouts(cfg: &Config, id: Option<i64>, limit: usize) -> Result<()> {
             let rows = st.query_map(params![limit as i64], |r| {
                 Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(4)?, r.get::<_, String>(5)?, r.get::<_, i64>(6)?, r.get::<_, i64>(7)?))
             })?;
-            println!("{:>5}  {:<17} {:>10} {:<7} {:<8} {:>6} {:>14}  reason", "id", "created (UTC)", "height", "mode", "status", "items", "ARK");
+            println!("{:>5}  {:<17} {:>10} {:<7} {:<8} {:>6} {:>14}  reason", "id", "created (UTC)", "height", "mode", "status", "items", sym());
             for r in rows {
                 let (id, at, h, mode, status, reason, n, sum) = r?;
                 let t = chrono::DateTime::from_timestamp(at, 0).map(|d| d.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
@@ -425,7 +472,8 @@ fn cmd_payouts(cfg: &Config, id: Option<i64>, limit: usize) -> Result<()> {
             println!("transactions of payout #{id}:");
             for r in rows {
                 let (n, fee, status, txid, att, err) = r?;
-                println!("  nonce {n}  fee {}  {status}  {txid}  broadcasts {att}  {err}", fmt_ark(fee as i128));
+                let txid = if txid.is_empty() { txid } else { format!("0x{txid}") };
+                println!("  nonce {n}  fee {} {}  {status}  {txid}  broadcasts {att}  {err}", fmt_ark(fee as i128), sym());
             }
             let mut st = conn.prepare("SELECT account, recipient, amount, COALESCE(slot,-1), status FROM payout_items WHERE payout_id=?1 ORDER BY amount DESC")?;
             let rows = st.query_map(params![id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?)))?;
@@ -434,7 +482,7 @@ fn cmd_payouts(cfg: &Config, id: Option<i64>, limit: usize) -> Result<()> {
                 let (a, to, amt, slot, status) = r?;
                 let to = if to == a { String::new() } else { format!(" -> {to}") };
                 let slot = if slot < 0 { "no tx".into() } else { format!("nonce {slot}") };
-                println!("  {a}{to}  {} ARK  {slot}  {status}", fmt_ark(amt as i128));
+                println!("  {a}{to}  {} {}  {slot}  {status}", fmt_ark(amt as i128), sym());
             }
         }
     }
@@ -471,12 +519,11 @@ fn cmd_run(cli: &Cli, mut cfg: Config) -> Result<()> {
     let mut conn = open_db(&cfg)?;
     let me = Me::load(&conn)?;
     cfg.bind_validator(&me.address);
-    let mut api = Api::new(&cfg.api, cfg.requests_per_minute);
+    let mut api = api_for(&cfg);
     let mut node = api.node_info()?;
-    if node.pub_key_hash != me.network || db::get(&conn, "nethash")?.as_deref() != Some(node.nethash.as_str()) {
-        bail!(Fatal(format!("{} is on a different network than this database", cfg.api)));
+    if node.chain_id != me.chain_id || db::get(&conn, "nethash")?.as_deref() != Some(node.nethash.as_str()) {
+        bail!(Fatal(format!("{} is on a different network than this database (chain id {}, database {})", cfg.api, node.chain_id, me.chain_id)));
     }
-    cfg.check_network(node.pub_key_hash).map_err(|e| Fatal(format!("{e:#}")))?;
     let mut signer = if cfg.payout_enabled { Some(signer_for(&cfg, &me, &mut api)?) } else { None };
     info!(
         "ark-tbw {} started for {} ({}), {} mode, node {}",
@@ -493,9 +540,8 @@ fn cmd_run(cli: &Cli, mut cfg: Config) -> Result<()> {
         if hup.swap(false, Ordering::Relaxed) {
             match Config::load(&config_path(cli)).and_then(|mut c| {
                 c.bind_validator(&me.address);
-                c.check_network(node.pub_key_hash)?;
-                if c.api != cfg.api || c.validator != cfg.validator || c.data_dir != cfg.data_dir {
-                    bail!("network.api, validator.name and storage.data_dir need a restart");
+                if c.api != cfg.api || c.rpc != cfg.rpc || c.tx_api != cfg.tx_api || c.validator != cfg.validator || c.data_dir != cfg.data_dir {
+                    bail!("network.api, network.rpc, network.tx_api, validator.name and storage.data_dir need a restart");
                 }
                 Ok(c)
             }) {
@@ -568,7 +614,16 @@ fn cmd_run(cli: &Cli, mut cfg: Config) -> Result<()> {
                 };
                 let Some(r) = res else { break };
                 if behind > 200 {
-                    info!("caught up to {} ({} own blocks in this chunk, {} to go)", r.height, r.own_blocks, target.saturating_sub(r.height));
+                    info!(
+                        "caught up to {} ({} own blocks in this chunk, {} checked against the node, {} to go)",
+                        r.height,
+                        r.own_blocks,
+                        r.verified,
+                        target.saturating_sub(r.height)
+                    );
+                }
+                if r.corrected > 0 {
+                    warn!("{} voter balance(s) corrected from the node's account history", r.corrected);
                 }
                 if r.payout_due {
                     do_payout(&cfg, &node, &me, signer.as_ref(), &mut api, &mut conn, r.height, "block count")?;
@@ -585,7 +640,7 @@ fn cmd_run(cli: &Cli, mut cfg: Config) -> Result<()> {
             if caught_up && last_reconcile.map_or(true, |t| t.elapsed() > Duration::from_secs(3600)) {
                 let mut eng = Engine::load(&cfg, &mut api, &mut conn)?;
                 match eng.reconcile()? {
-                    Some(0) => info!("voter check: all {} voters match the node", eng.wallets.values().filter(|w| w.voting).count()),
+                    Some(0) => info!("voter check: all {} voters and balances match the node", eng.wallets.values().filter(|w| w.voting).count()),
                     Some(n) => warn!("voter check: repaired {n} wallet(s)"),
                     None => {}
                 }
@@ -610,7 +665,7 @@ fn cmd_run(cli: &Cli, mut cfg: Config) -> Result<()> {
     Ok(())
 }
 
-fn do_payout(cfg: &Config, node: &NodeInfo, me: &Me, signer: Option<&tx::Signer>, api: &mut Api, conn: &mut Connection, height: u64, reason: &str) -> Result<()> {
+fn do_payout(cfg: &Config, node: &NodeInfo, me: &Me, signer: Option<&payout::Signer>, api: &mut Api, conn: &mut Connection, height: u64, reason: &str) -> Result<()> {
     match signer {
         Some(s) if cfg.payout_enabled => payout::run_live(cfg, node, me, s, api, conn, height, reason).context("payout"),
         _ => payout::run_shadow(cfg, node, me, conn, height, reason),
@@ -623,7 +678,7 @@ mod tests {
 
     #[test]
     fn schedule_times() {
-        let t = "[network]\napi=\"http://x/api\"\n[validator]\nname=\"d\"\n[share]\npercent=50\n[payout]\nat=[\"00:00\",\"12:00\"]\n";
+        let t = "[network]\napi=\"https://testnet.mainsailhq.com/api\"\n[validator]\nname=\"d\"\n[share]\npercent=50\n[payout]\nat=[\"00:00\",\"12:00\"]\n";
         let c = Config::parse(t, std::path::Path::new("/tmp/c.toml")).unwrap();
         let base = chrono::NaiveDate::from_ymd_opt(2026, 11, 26).unwrap();
         let ts = |h: u32, m: u32| base.and_hms_opt(h, m, 0).unwrap().and_utc().timestamp();
