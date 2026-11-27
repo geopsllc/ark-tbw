@@ -54,12 +54,12 @@ Re-run to upgrade: config, secret and database are kept, the service is restarte
 USAGE
 }
 
-ROOTLESS=0 FROM_SOURCE=0 VERSION="" FROM_HEIGHT="" DIR="$HOME/.ark-tbw" BINARY="" SRC="" SERVICE=1 YES=0
+ROOTLESS=0 FROM_SOURCE=0 TAG="" FROM_HEIGHT="" DIR="$HOME/.ark-tbw" BINARY="" SRC="" SERVICE=1 YES=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --rootless) ROOTLESS=1 ;;
     --from-source) FROM_SOURCE=1 ;;
-    --version) VERSION="$2"; shift ;;
+    --version) TAG="$2"; shift ;;
     --from-height) FROM_HEIGHT="$2"; shift ;;
     --dir) DIR="$2"; shift ;;
     --binary) BINARY="$2"; shift ;;
@@ -104,10 +104,10 @@ case "$(uname -m)" in
   *) die "unsupported CPU $(uname -m): x86_64 and arm64 only" ;;
 esac
 if [ -r /etc/os-release ]; then
-  . /etc/os-release
-  case "${ID:-}:${VERSION_ID:-}" in
+  os=$(. /etc/os-release; echo "${ID:-}:${VERSION_ID:-}")
+  case "$os" in
     ubuntu:22.04|ubuntu:24.04|ubuntu:26.04) ;;
-    *) warn "tested on Ubuntu 22.04, 24.04 and 26.04; this is ${PRETTY_NAME:-unknown}" ;;
+    *) warn "tested on Ubuntu 22.04, 24.04 and 26.04; this is $(. /etc/os-release; echo "${PRETTY_NAME:-unknown}")" ;;
   esac
 fi
 SUDO=""
@@ -144,13 +144,13 @@ if [ -n "$BINARY" ]; then
   [ -f "$BINARY" ] || die "no file $BINARY"
   cp "$BINARY" "$WORK/ark-tbw"
 elif [ "$FROM_SOURCE" = 0 ]; then
-  [ -n "$VERSION" ] || VERSION=$(latest_release)
-  if [ -z "$VERSION" ]; then
+  [ -n "$TAG" ] || TAG=$(latest_release)
+  if [ -z "$TAG" ]; then
     warn "no release published for $NETWORK yet: building from source instead"
     FROM_SOURCE=1
   else
-    say "downloading ark-tbw $VERSION ($ARCH)"
-    base="https://github.com/$REPO/releases/download/$VERSION"
+    say "downloading ark-tbw $TAG ($ARCH)"
+    base="https://github.com/$REPO/releases/download/$TAG"
     curl -fsSL -o "$WORK/ark-tbw" "$base/ark-tbw-$ARCH-linux" || die "download failed: $base/ark-tbw-$ARCH-linux"
     if curl -fsSL -o "$WORK/SHA256SUMS" "$base/SHA256SUMS"; then
       want=$(grep " ark-tbw-$ARCH-linux\$" "$WORK/SHA256SUMS" | cut -d' ' -f1)
@@ -160,14 +160,14 @@ elif [ "$FROM_SOURCE" = 0 ]; then
     else
       warn "release has no SHA256SUMS; checksum not verified"
     fi
-    REF=$VERSION
+    REF=$TAG
   fi
 fi
 if [ -z "$BINARY" ] && [ "$FROM_SOURCE" = 1 ]; then
   if [ -z "$SRC" ]; then
     command -v git >/dev/null || die "git is needed to build from source"
     say "fetching the source ($BRANCH)"
-    git clone -q --depth 1 -b "${VERSION:-$BRANCH}" "https://github.com/$REPO.git" "$WORK/src" || die "could not clone $REPO"
+    git clone -q --depth 1 -b "${TAG:-$BRANCH}" "https://github.com/$REPO.git" "$WORK/src" || die "could not clone $REPO"
     SRC="$WORK/src"
   fi
   if ! command -v cargo >/dev/null; then
