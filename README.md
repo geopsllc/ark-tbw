@@ -216,6 +216,12 @@ transaction is signed and refunded the difference once it confirms. If the keep 
 fees are carried as keep debt and paid off by later blocks. A 200-voter multipayment uses about
 4.9 million gas, 0.0245 TARK at 5 gwei.
 
+The memo (`payout.memo`) goes in the data of a single transfer, and once per multipayment,
+appended after the payment list. The contract ignores those extra bytes, so they cost only
+their gas (16 per byte, once per transaction, not per recipient). ARK Wallet shows the memo of
+transfers; showing a multipayment's memo needs a wallet or explorer that reads the bytes after
+the payment list.
+
 Amounts in the database and on screen have 8 decimals, as on ARK Core; on chain they are wei
 (18 decimals). A voter's weight is its balance rounded down to 8 decimals.
 

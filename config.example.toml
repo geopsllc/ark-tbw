@@ -66,9 +66,10 @@ every_blocks = 160
 at = []
 # Unpaid balances below this (ARK) carry over to the next payout
 min_amount = 0
-# Memo in the data of single transfers (multipayments carry no memo)
+# Memo: in the data of single transfers, and once per multipayment after its payment list
+# (16 gas per byte, paid once per transaction; up to 255 bytes)
 memo = "myvalidator - true block weight"
-# Memo on the keep payment when it is a single transfer (default: memo)
+# Memo on the keep payment when it goes as a single transfer (default: memo)
 # keep_memo = "keep"
 # Pay many voters per transaction through the MultiPayment contract (up to 205 per
 # transaction, packed by gas; every transaction is checked with eth_estimateGas first)

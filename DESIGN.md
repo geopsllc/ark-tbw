@@ -93,6 +93,13 @@ before signing; if an estimate is above the plan, the plan is made again with a 
 
 The block gas limit is 10,000,000, so two full multipayments fit in one block.
 
+A multipayment carries one memo: `payout.memo` appended after the ABI-encoded arguments. The
+contract decodes its arguments through their offsets and never reads the extra bytes. Checked on
+testnet: with a 32-byte memo `eth_call` succeeds and `eth_estimateGas` rises by 518 (512 calldata
+gas + 6), the same call with a wrong value still reverts, and the pool decodes the signed
+transaction (an unfunded one is refused only for its balance). The plan adds the memo's calldata
+gas plus 50 to each multipayment.
+
 ## Edge cases found in core3-tbw and how ark-tbw handles them
 
 ### Allocation

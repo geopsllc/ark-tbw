@@ -11,6 +11,9 @@
 //!     existing (130 new) recipients fit. Recipients are packed by that model with a margin and
 //!     every transaction is checked with eth_estimateGas before it is signed.
 //!   - one recipient: a plain transfer, the memo in its data.
+//!   - the memo of a multipayment (payout.memo) is appended once after the ABI arguments: the
+//!     contract ignores the extra bytes (checked on testnet with eth_call / eth_estimateGas and
+//!     the pool), so it costs only its calldata gas plus a few gas, once per transaction.
 //! The contract forwards each amount with a 5,000 gas stipend and reports success per recipient
 //! (Payment logs); a failed amount comes back to the payout wallet in the same transaction.
 //! Such a recipient (a contract that needs more gas to receive) goes back to the ledger and is
@@ -39,6 +42,8 @@ pub const STUCK_ATTEMPTS: i64 = 30;
 pub const MAX_RECIPIENTS: usize = 205;
 /// Gas model of MultiPayment.pay (measured on testnet, calldata included).
 pub const MP_BASE_GAS: u64 = 42_000;
+/// Extra gas a memo appended to a multipayment costs beyond its calldata (measured: 6).
+pub const MP_MEMO_EXTRA_GAS: u64 = 50;
 pub const MP_EXISTING_GAS: u64 = 24_200;
 pub const MP_NEW_GAS: u64 = 38_800;
 /// Planned gas limits are the model plus this many percent.
@@ -96,7 +101,7 @@ pub struct Item {
 
 #[derive(Debug, Clone)]
 pub struct PlannedTx {
-    /// memo of a single transfer (multipayments carry none)
+    /// memo: the data of a single transfer, or appended after a multipayment's arguments
     pub memo: String,
     /// (recipient, amount in units)
     pub payments: Vec<(String, u64)>,
@@ -114,7 +119,9 @@ impl PlannedTx {
         let (to, value, data) = if self.is_multi() {
             let pays: Vec<(String, u128)> = self.payments.iter().map(|(a, v)| (a.clone(), *v as u128 * WEI_PER_UNIT)).collect();
             let value = pays.iter().map(|p| p.1).sum();
-            (evm::MULTIPAYMENT.to_string(), value, evm::pay_call(&pays).map_err(|e| anyhow!(e))?)
+            let mut data = evm::pay_call(&pays).map_err(|e| anyhow!(e))?;
+            data.extend_from_slice(self.memo.as_bytes());
+            (evm::MULTIPAYMENT.to_string(), value, data)
         } else {
             let (a, v) = &self.payments[0];
             (a.clone(), *v as u128 * WEI_PER_UNIT, self.memo.as_bytes().to_vec())
@@ -181,7 +188,10 @@ fn build_txs(cfg: &Config, gas: &Gas, rec: &Recipients, items: &mut [Item]) -> V
     let per = |a: &str| -> u64 { (if rec.existing.contains(a) { MP_EXISTING_GAS } else { MP_NEW_GAS }) * gas.scale_pct / 100 };
     let mut txs: Vec<PlannedTx> = Vec::new();
     let mut cur: Vec<(String, u64)> = Vec::new();
-    let mut cur_gas = MP_BASE_GAS;
+    // one memo per multipayment, paid once
+    let mp_memo = cfg.memo.clone();
+    let mp_base = MP_BASE_GAS + if mp_memo.is_empty() { 0 } else { evm::data_gas(mp_memo.as_bytes()) + MP_MEMO_EXTRA_GAS };
+    let mut cur_gas = mp_base;
     let close = |cur: &mut Vec<(String, u64)>, cur_gas: u64, txs: &mut Vec<PlannedTx>| {
         if cur.is_empty() {
             return;
@@ -193,14 +203,14 @@ fn build_txs(cfg: &Config, gas: &Gas, rec: &Recipients, items: &mut [Item]) -> V
             txs.push(PlannedTx { memo, payments: p, gas_limit: limit, fee: fee_units(limit, gas.price) });
         } else {
             let limit = with_margin(cur_gas).min(gas.max);
-            txs.push(PlannedTx { memo: String::new(), payments: p, gas_limit: limit, fee: fee_units(limit, gas.price) });
+            txs.push(PlannedTx { memo: mp_memo.clone(), payments: p, gas_limit: limit, fee: fee_units(limit, gas.price) });
         }
     };
     for (r, amt) in multi {
         let g = per(&r);
         if !cur.is_empty() && (cur.len() >= MAX_RECIPIENTS || with_margin(cur_gas + g) > gas.max) {
             close(&mut cur, cur_gas, &mut txs);
-            cur_gas = MP_BASE_GAS;
+            cur_gas = mp_base;
         }
         cur.push((r, amt));
         cur_gas += g;
@@ -761,7 +771,10 @@ mod tests {
         assert!(p.items.iter().all(|i| i.account != B));
         assert_eq!(p.txs.len(), 1);
         assert_eq!(p.txs[0].payments.len(), 2); // A + keep in one multipayment
-        assert_eq!(p.txs[0].gas_limit, (MP_BASE_GAS + 2 * MP_NEW_GAS) * 103 / 100);
+        // memo "m": 16 calldata gas plus the extra, once
+        assert_eq!(p.txs[0].gas_limit, (MP_BASE_GAS + 16 + MP_MEMO_EXTRA_GAS + 2 * MP_NEW_GAS) * 103 / 100);
+        let e = p.txs[0].evm(11812, 0, 1).unwrap();
+        assert_eq!(e.data, format!("{}6d", hex::encode(evm::pay_call(&p.txs[0].payments.iter().map(|(a, v)| (a.clone(), *v as u128 * WEI_PER_UNIT)).collect::<Vec<_>>()).unwrap())));
         let main_keep = p.items.iter().find(|i| i.account == R).unwrap().amount as i64;
         assert_eq!(main_keep, 400_000_000 - p.total_fee as i64);
         assert_eq!(p.main_keep_charge, 400_000_000);
@@ -862,6 +875,61 @@ mod tests {
 #[cfg(test)]
 mod live {
     use super::*;
+
+    /// `cargo test multipayment_memo_probe -- --ignored --nocapture`: is a multipayment with a
+    /// memo appended after the ABI arguments executed like one without? Simulated by the node
+    /// (eth_call / eth_estimateGas from a funded wallet, nothing is sent), then signed from an
+    /// empty wallet and posted so the pool has to decode it.
+    #[test]
+    #[ignore]
+    fn multipayment_memo_probe() {
+        let api_url = "https://testnet.mainsailhq.com/api";
+        let (rpc, pool) = crate::api::default_urls(api_url).unwrap();
+        let mut api = Api::new(api_url, &rpc, &pool, 0, 60);
+        let node = api.node_info().unwrap();
+        let funded = "0x7783464d965A1E6a13B19b8222C56C53d32414ad"; // geop5, holds TARK
+        let pays = vec![("0xe5a97E663158dEaF3b65bBF88897b8359Dc19F81".to_string(), 1u128), ("0x4F1D3A2f79AADeC9ecb53b6Ee66854bDE9665aE4".to_string(), 2u128)];
+        let plain = evm::pay_call(&pays).unwrap();
+        let memo = "geop5 - true block weight payout";
+        let mut with_memo = plain.clone();
+        with_memo.extend_from_slice(memo.as_bytes());
+        let call = |api: &mut Api, value: u128, data: &[u8]| {
+            api.rpc_call(
+                "eth_call",
+                serde_json::json!([{"from": funded, "to": evm::MULTIPAYMENT, "value": format!("0x{value:x}"), "data": format!("0x{}", hex::encode(data))}, "latest"]),
+            )
+        };
+        let g_plain = api.estimate_gas(funded, evm::MULTIPAYMENT, 3, &plain).unwrap();
+        let g_memo = api.estimate_gas(funded, evm::MULTIPAYMENT, 3, &with_memo).unwrap();
+        println!("estimateGas plain {g_plain}, with {}-byte memo {g_memo} (+{})", memo.len(), g_memo - g_plain);
+        println!("eth_call plain: {:?}", call(&mut api, 3, &plain));
+        println!("eth_call memo:  {:?}", call(&mut api, 3, &with_memo));
+        // control: the simulation is real, a wrong value must revert with or without the memo
+        let bad = call(&mut api, 4, &with_memo);
+        println!("eth_call memo, wrong value: {bad:?}");
+        assert!(bad.is_err(), "a value that does not match the amounts must revert");
+        // calldata gas plus a few gas of copying inside the call
+        assert!(g_memo - g_plain >= evm::data_gas(memo.as_bytes()) && g_memo - g_plain < evm::data_gas(memo.as_bytes()) + 50);
+        assert!(call(&mut api, 3, &with_memo).is_ok());
+
+        // what the planner builds (memo appended, gas limit from the model) fits the node's estimate
+        let pt = PlannedTx { memo: memo.into(), payments: vec![(pays[0].0.clone(), 1), (pays[1].0.clone(), 2)], gas_limit: 0, fee: 0 };
+        let e = pt.evm(node.chain_id, 0, node.min_gas_price).unwrap();
+        assert_eq!(hex::decode(&e.data).unwrap().len(), with_memo.len());
+        let est = api.estimate_gas(funded, &e.to, e.value, &hex::decode(&e.data).unwrap()).unwrap();
+        let planned = (MP_BASE_GAS + evm::data_gas(memo.as_bytes()) + MP_MEMO_EXTRA_GAS + 2 * MP_EXISTING_GAS) * 103 / 100;
+        println!("planner multipayment: estimate {est}, planned limit {planned}");
+        assert!(est <= planned);
+
+        // the pool: signed with the memo from an empty wallet, it must get as far as the balance check
+        let signer = Signer::new(KeyPair::from_passphrase("ark-tbw throwaway unfunded test wallet 7f3a").unwrap(), None, node.chain_id).unwrap();
+        let t = EvmTx { chain_id: node.chain_id, nonce: 0, gas_price: node.min_gas_price, gas_limit: g_memo + 10_000, to: evm::MULTIPAYMENT.into(), value: 3, data: hex::encode(&with_memo) };
+        let st = signer.sign(&t).unwrap();
+        let res = api.broadcast(&[(st.hash.clone(), st.serialized.clone())]).unwrap();
+        println!("pool: {res:?}");
+        assert!(res.accepted.is_empty());
+        assert!(res.rejected[0].2.contains("Insufficient balance"), "the pool should only object to the empty wallet");
+    }
 
     /// `cargo test broadcast_unfunded -- --ignored --nocapture`: signs a multipayment from a
     /// throwaway, never-funded testnet wallet, estimates it and posts it. The pool must reject it
