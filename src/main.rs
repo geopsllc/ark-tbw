@@ -442,7 +442,7 @@ fn cmd_blocks(cfg: &Config, limit: usize) -> Result<()> {
     let conn = open_db(cfg)?;
     let mut st = conn.prepare("SELECT height, ts, reward + fee, voter_bps, voters, to_voters, to_keep FROM blocks ORDER BY height DESC LIMIT ?1")?;
     let rows = st.query_map(params![limit as i64], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?, r.get::<_, i64>(5)?, r.get::<_, i64>(6)?)))?;
-    println!("{:>10}  {:<20} {:>12} {:>7} {:>6} {:>14} {:>14}", "height", "time (UTC)", "forged", "share", "paid", "to voters", "to keep");
+    println!("{:>10}  {:<20} {:>12} {:>7} {:>6} {:>14} {:>14}", "height", "time (UTC)", "reward", "share", "voters", "shared", "kept");
     for r in rows {
         let (h, ts, total, bps, n, v, res) = r?;
         let t = chrono::DateTime::from_timestamp(ts + 1_490_101_200, 0).map(|d| d.format("%Y-%m-%d %H:%M:%S").to_string()).unwrap_or_default();
