@@ -282,6 +282,7 @@ Amounts in the database and on screen have 8 decimals, as on ARK Core; on chain 
 cargo test                                          # unit tests (no network)
 cargo test broadcast_unfunded -- --ignored          # posts a multipayment from an empty testnet wallet; must be rejected
 tools/test-ubuntu.sh                                # runs the Linux binary on Ubuntu 22.04 / 24.04 / 26.04 in Docker
+tools/release.sh mainsail-v0.2.0 notes.md --prerelease   # maintainers: build, tag and publish a release (macOS keychain token)
 ```
 
 ## Credits
