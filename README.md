@@ -30,13 +30,14 @@ On the server, as the account that should run ark-tbw (not root; it asks for sud
 curl -fsSL https://raw.githubusercontent.com/geopsllc/ark-tbw/main/install.sh | bash
 ```
 
-It asks for your validator, the node API, the voter share, the memo and the passphrase, then:
+It asks for your validator, the node API, the voter share, the keep address, the memo and the passphrase, then:
 
 | | |
 |---|---|
 | binary | `/usr/local/bin/ark-tbw` (a release download, checked against its SHA256SUMS; built from source with Rust when no release is published) |
 | config | `~/.ark-tbw/config.toml`, payouts in **shadow mode** (`payout.enabled = false`) |
-| passphrase | `~/.ark-tbw/secret.toml`, chmod 600 (Enter skips it; add it before you go live) |
+| keep address | `share.keep_address` (Enter: the keep stays in the validator wallet) |
+| passphrase | the validator **wallet** passphrase, in `~/.ark-tbw/secret.toml`, chmod 600 (Enter skips it; add it before you go live) |
 | database | `~/.ark-tbw/ark-tbw.db`, initialised at the current tip |
 | service | the systemd system service, enabled at boot and started |
 
@@ -61,7 +62,7 @@ curl -fsSL https://raw.githubusercontent.com/geopsllc/ark-tbw/main/install.sh | 
 | `--version TAG` | install a specific release |
 | `--dir DIR` | config folder other than `~/.ark-tbw` |
 | `--no-service` | install and initialise only |
-| `-y` | no questions: defaults, or the values in `TBW_VALIDATOR`, `TBW_API`, `TBW_SHARE`, `TBW_MEMO` |
+| `-y` | no questions: defaults, or the values in `TBW_VALIDATOR`, `TBW_API`, `TBW_SHARE`, `TBW_KEEP`, `TBW_MEMO` |
 
 With `--rootless`, install `curl`, `build-essential` and `git` first if they are missing (the
 script cannot use sudo then).

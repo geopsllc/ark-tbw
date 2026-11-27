@@ -18,7 +18,8 @@
 #   --binary FILE       install this binary instead of downloading or building one
 #   --src DIR           use this source tree (for --from-source and the example config)
 #   --no-service        install and initialise, but do not install or start the service
-#   -y, --yes           no questions: defaults, or TBW_VALIDATOR, TBW_API, TBW_SHARE, TBW_MEMO
+#   -y, --yes           no questions: defaults, or TBW_VALIDATOR, TBW_API, TBW_SHARE,
+#                       TBW_KEEP, TBW_MEMO
 set -euo pipefail
 
 # ---- network of this branch -------------------------------------------------------------------
@@ -48,7 +49,8 @@ Options:
   --binary FILE       install this binary instead of downloading or building one
   --src DIR           use this source tree (for --from-source and the example config)
   --no-service        install and initialise, but do not install or start the service
-  -y, --yes           no questions: defaults, or TBW_VALIDATOR, TBW_API, TBW_SHARE, TBW_MEMO
+  -y, --yes           no questions: defaults, or TBW_VALIDATOR, TBW_API, TBW_SHARE,
+                      TBW_KEEP, TBW_MEMO
 
 Re-run to upgrade: config, secret and database are kept, the service is restarted.
 USAGE
@@ -225,16 +227,23 @@ else
     [ "$TTY" = 1 ] || die "share must be a percentage from 0 to 100"
     echo "  a percentage from 0 to 100, at most 2 decimals"
   done
+  while :; do
+    ask V_KEEP "Address the keep is paid to (Enter = it stays in the validator wallet)" "${TBW_KEEP:-}"
+    [ -z "$V_KEEP" ] || [[ "$V_KEEP" =~ ^A[1-9A-HJ-NP-Za-km-z]{33}$ ]] && break
+    [ "$TTY" = 1 ] || die "keep address must be an ARK address"
+    echo "  an ARK address (A and 33 more characters), or Enter for none"
+  done
   ask V_MEMO "Payout memo (public)" "${TBW_MEMO:-$V_NAME - true block weight}"
   rate=0
   [ "${V_API%/}" = "$API_PUBLIC" ] && rate=$API_PUBLIC_RATE
   # only the first occurrence of each key in the example is replaced
   # values go through the environment: awk -v would interpret backslashes
-  T_API="$(toml_str "${V_API%/}")" T_NAME="$(toml_str "$V_NAME")" T_SHARE="$V_SHARE" T_MEMO="$(toml_str "$V_MEMO")" T_RATE="$rate" awk '
+  T_API="$(toml_str "${V_API%/}")" T_NAME="$(toml_str "$V_NAME")" T_SHARE="$V_SHARE" T_MEMO="$(toml_str "$V_MEMO")" T_RATE="$rate" T_KEEP="$V_KEEP" awk '
     !a && /^api = /                 { print "api = " ENVIRON["T_API"]; a=1; next }
     !r && /^requests_per_minute = / { print "requests_per_minute = " ENVIRON["T_RATE"]; r=1; next }
     !n && /^name = /                { print "name = " ENVIRON["T_NAME"]; n=1; next }
     !p && /^percent = /             { print "percent = " ENVIRON["T_SHARE"]; p=1; next }
+    !k && /^# keep_address = / && ENVIRON["T_KEEP"] != "" { print "keep_address = \"" ENVIRON["T_KEEP"] "\""; k=1; next }
     !m && /^memo = /                { print "memo = " ENVIRON["T_MEMO"]; m=1; next }
     !e && /^enabled = /             { print "enabled = false"; e=1; next }
     { print }' "$WORK/example.toml" > "$WORK/config.toml"
@@ -247,10 +256,13 @@ if [ -f "$SECRET" ]; then
   chmod 600 "$SECRET"
 else
   echo
-  say "the validator passphrase signs the payouts; it is stored only in $SECRET (chmod 600)"
-  ask_secret V_PASS "Validator passphrase (Enter to add it later)"
+  say "payouts are signed with the validator WALLET passphrase: the 12 or 24 words of the"
+  echo "    validator's address, the ones you import into ARK Wallet (and forge with)."
+  echo "    It is stored only in $SECRET (chmod 600)."
+  ask_secret V_PASS "Validator wallet passphrase (Enter to add it later)"
   if [ -n "$V_PASS" ]; then
-    ask_secret V_PASS2 "Second passphrase, if the wallet has one (Enter for none)"
+    say "a second passphrase is the wallet's optional second signature; most wallets have none"
+    ask_secret V_PASS2 "Second passphrase, only if the wallet has one registered (Enter for none)"
     ( umask 077
       { printf 'passphrase = %s\n' "$(toml_str "$V_PASS")"
         [ -z "$V_PASS2" ] || printf 'second_passphrase = %s\n' "$(toml_str "$V_PASS2")"
@@ -258,7 +270,7 @@ else
     unset V_PASS V_PASS2
     say "wrote $SECRET"
   else
-    ( umask 077; printf '# passphrase = "..."\n# second_passphrase = "..."   (only if the wallet has one)\n' > "$SECRET" )
+    ( umask 077; printf '# validator WALLET passphrase\n# passphrase = "..."\n# second_passphrase = "..."   (only if the wallet has one)\n' > "$SECRET" )
     warn "no passphrase yet: add it to $SECRET before you enable payouts"
   fi
 fi
