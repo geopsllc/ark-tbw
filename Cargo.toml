@@ -1,6 +1,6 @@
 [package]
 name = "ark-tbw"
-version = "0.1.0"
+version = "0.1.1"
 description = "All-in-one true block weight reward sharing for ARK Mainsail validators"
 edition = "2021"
 license-file = "LICENSE"
