@@ -208,7 +208,9 @@ mkdir -p "$DIR"
 chmod 700 "$DIR"
 toml_str() { local s=$1; s=${s//\\/\\\\}; s=${s//\"/\\\"}; printf '"%s"' "$s"; }
 
+UPGRADE=0
 if [ -f "$CFG" ]; then
+  UPGRADE=1
   say "keeping your config $CFG"
 else
   if [ -n "$SRC" ] && [ -f "$SRC/config.example.toml" ]; then
@@ -290,16 +292,36 @@ if [ "$SERVICE" = 1 ]; then
   echo
   unit=/etc/systemd/system/ark-tbw.service
   [ "$ROOTLESS" = 1 ] && unit="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/ark-tbw.service"
-  [ -f "$unit" ] && was=1 || was=0
-  say "installing the service ($([ "$ROOTLESS" = 1 ] && echo "user service" || echo "system service"))"
-  # (re)writes the unit, so an upgrade picks up the binary path and config
-  if [ "$ROOTLESS" = 1 ]; then "$TBW" --config "$CFG" service install --rootless; else sudo "$TBW" --config "$CFG" service install; fi
-  if [ "$was" = 1 ]; then "$TBW" restart; else "$TBW" start; fi
+  kind=$([ "$ROOTLESS" = 1 ] && echo "user service" || echo "system service")
+  if [ -f "$unit" ]; then
+    # an upgrade: the unit is only rewritten when this version would write a different one
+    # (new binary path, config path or service options); otherwise a restart is enough
+    if [ "$ROOTLESS" = 1 ]; then want=$("$TBW" --config "$CFG" service show --rootless 2>/dev/null || true)
+    else want=$("$TBW" --config "$CFG" service show 2>/dev/null || true); fi
+    if [ -n "$want" ] && [ "$want" = "$(cat "$unit" 2>/dev/null)" ]; then
+      say "restarting the $kind on the new binary"
+    else
+      say "updating the $kind file (it changed in this version)"
+      if [ "$ROOTLESS" = 1 ]; then "$TBW" --config "$CFG" service install --rootless >/dev/null; else sudo "$TBW" --config "$CFG" service install >/dev/null; fi
+    fi
+    "$TBW" restart
+  else
+    say "installing the $kind"
+    if [ "$ROOTLESS" = 1 ]; then "$TBW" --config "$CFG" service install --rootless; else sudo "$TBW" --config "$CFG" service install; fi
+    "$TBW" start
+  fi
   sleep 3
   "$TBW" -c "$CFG" status || true
 fi
 
 echo
+if [ "$UPGRADE" = 1 ]; then
+  say "upgraded to $("$TBW" --version)$([ "$SERVICE" = 1 ] && echo ", service restarted")"
+  if awk '/^\[payout\]/{p=1;next} /^\[/{p=0} p && /^enabled *= *false/{f=1} END{exit !f}' "$CFG"; then
+    echo "    payouts are still in shadow mode (payout.enabled = false in $CFG)"
+  fi
+  exit 0
+fi
 say "done. Next:"
 cat <<EOF
     ark-tbw logs -f            follow the service log
