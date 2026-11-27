@@ -22,10 +22,31 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use sync::{Engine, Me};
 
+const AFTER_HELP: &str = "\
+Getting started:
+  ark-tbw init                       read your voters as of now (or --from-height N)
+  ark-tbw check                      check config, node and secret; changes nothing
+  sudo ark-tbw service install       install the systemd service (or: service install --rootless)
+  ark-tbw start                      start it;  ark-tbw logs -f  to follow it
+
+Day to day:
+  ark-tbw status                     sync height, share, next payout, unpaid totals
+  ark-tbw voters [--all]             weight, unpaid and paid per voter
+  ark-tbw blocks [-n 50]             your last blocks and how each was split
+  ark-tbw payouts [ID]               payout history, or one payout in detail
+  ark-tbw share set 60 [--from-height 37900000]
+                                     change the voter share (the keep is 100 - share)
+  ark-tbw pay-now                    pay out now
+  ark-tbw cancel-payout ID           cancel a stuck payout (nothing can be paid twice)
+  ark-tbw reload                     re-read the config after editing it
+
+The config is ~/.ark-tbw/config.toml unless -c/--config or ARK_TBW_CONFIG says otherwise.
+Every option is explained in config.example.toml. More: ark-tbw <command> --help";
+
 #[derive(Parser)]
-#[command(name = "ark-tbw", version, about = "True block weight reward sharing for ARK Core v3 validators")]
+#[command(name = "ark-tbw", version, after_help = AFTER_HELP, about = "True block weight reward sharing for ARK Core v3 validators")]
 struct Cli {
-    /// Config file
+    /// Config file [default: ~/.ark-tbw/config.toml]
     #[arg(short, long, global = true, env = "ARK_TBW_CONFIG")]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -57,12 +78,15 @@ enum Cmd {
     },
     /// Recent payouts, or one payout in detail
     Payouts {
+        /// Show this payout in detail: its transactions and every payment
         id: Option<i64>,
+        /// How many payouts to list
         #[arg(short = 'n', long, default_value_t = 10)]
         limit: usize,
     },
     /// The validator's processed blocks and how each was split
     Blocks {
+        /// How many blocks to list
         #[arg(short = 'n', long, default_value_t = 20)]
         limit: usize,
     },
@@ -74,12 +98,16 @@ enum Cmd {
     /// Ask the running service to pay out now
     PayNow,
     /// Cancel a stuck payout (consumes its nonces; nothing can be paid twice)
-    CancelPayout { id: i64 },
+    CancelPayout {
+        /// Payout id, from  ark-tbw payouts
+        id: i64,
+    },
     /// Show the service log (journald)
     Logs {
         /// Follow new lines
         #[arg(short, long)]
         follow: bool,
+        /// How many lines to show
         #[arg(short = 'n', long, default_value_t = 100)]
         lines: u32,
         /// e.g. "1 hour ago", "today", "2026-11-26 10:00"
@@ -107,6 +135,7 @@ enum ShareCmd {
     Set {
         /// New voter share in percent, e.g. 60 or 85.5
         percent: String,
+        /// First block split with the new share (default: the next block to be processed)
         #[arg(long)]
         from_height: Option<u64>,
     },

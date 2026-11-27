@@ -26,11 +26,33 @@ REPO=geopsllc/ark-tbw
 BRANCH=main
 TAG_PREFIX=v                      # releases of this branch: v0.1.0, v0.2.0, ...
 NETWORK="ARK Core v3 mainnet"
-COIN=ARK
 API_PUBLIC=https://api.ark.io/api
 API_PUBLIC_RATE=170               # requests per minute allowed on the public API
 API_LOCAL=http://127.0.0.1:4003/api
 # ------------------------------------------------------------------------------------------------
+
+usage() {
+  cat <<'USAGE'
+ark-tbw installer. Run as the account that should own ark-tbw (not root):
+
+  curl -fsSL https://raw.githubusercontent.com/geopsllc/ark-tbw/main/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/geopsllc/ark-tbw/main/install.sh | bash -s -- OPTIONS
+  bash install.sh OPTIONS
+
+Options:
+  --rootless          user service and ~/.local/bin, no sudo at all
+  --from-source       build with Rust instead of downloading a release binary
+  --version TAG       a specific release (default: the latest for this network)
+  --from-height N     start the database right after block N (default: the current tip)
+  --dir DIR           config folder (default: ~/.ark-tbw)
+  --binary FILE       install this binary instead of downloading or building one
+  --src DIR           use this source tree (for --from-source and the example config)
+  --no-service        install and initialise, but do not install or start the service
+  -y, --yes           no questions: defaults, or TBW_VALIDATOR, TBW_API, TBW_SHARE, TBW_MEMO
+
+Re-run to upgrade: config, secret and database are kept, the service is restarted.
+USAGE
+}
 
 ROOTLESS=0 FROM_SOURCE=0 VERSION="" FROM_HEIGHT="" DIR="$HOME/.ark-tbw" BINARY="" SRC="" SERVICE=1 YES=0
 while [ $# -gt 0 ]; do
@@ -44,7 +66,7 @@ while [ $# -gt 0 ]; do
     --src) SRC="$2"; shift ;;
     --no-service) SERVICE=0 ;;
     -y|--yes) YES=1 ;;
-    -h|--help) sed -n '2,25p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) echo "unknown option $1 (see --help)" >&2; exit 1 ;;
   esac
   shift

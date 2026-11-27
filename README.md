@@ -177,6 +177,9 @@ can look first. `ark-tbw logs` reads journald, the same as `journalctl -u ark-tb
 
 ## Day to day
 
+`ark-tbw --help` lists every command with examples; `ark-tbw <command> --help` shows its
+options (`install.sh --help` does the same for the installer).
+
 ```bash
 ark-tbw status              # sync height, share, next payout, unpaid totals
 ark-tbw voters              # weight, unpaid and paid per voter (--all: incl. former voters)

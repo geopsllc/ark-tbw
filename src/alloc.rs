@@ -115,6 +115,7 @@ mod tests {
     const A: &str = "AKdr5d9AMEnsKYxpDcoHdyyjSCKVx3r9Nj";
     const B: &str = "AKfpFjpqUAGTjuAcwfQnVNuY7Z3tKz1RFy";
     const C: &str = "ANcUgCY6ubwNCXXnnBPdz4ceH3FYtCUeE1";
+    #[allow(dead_code)]
     const K: &str = "AMvXMDJorQpRqXXErDqKEfEAdjsoaYeeYW";
 
     fn cfg(extra_share: &str, keep: &str) -> Config {
