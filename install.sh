@@ -116,18 +116,16 @@ if [ "$ROOTLESS" = 0 ]; then
   SUDO=sudo
 fi
 
-need_pkgs=()
-command -v curl >/dev/null || need_pkgs+=(curl)
-[ -e /etc/ssl/certs/ca-certificates.crt ] || need_pkgs+=(ca-certificates)
-if [ "$FROM_SOURCE" = 1 ] && [ -z "$BINARY" ]; then
-  command -v cc >/dev/null || need_pkgs+=(build-essential)
-  [ -n "$SRC" ] || command -v git >/dev/null || need_pkgs+=(git)
-fi
-if [ ${#need_pkgs[@]} -gt 0 ]; then
-  [ -n "$SUDO" ] || die "missing ${need_pkgs[*]}: install them (sudo apt install ${need_pkgs[*]}) and run again"
-  say "installing ${need_pkgs[*]}"
-  $SUDO apt-get update -qq && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${need_pkgs[@]}" >/dev/null
-fi
+apt_need() { # apt_need pkg... : install what is missing
+  [ $# -gt 0 ] || return 0
+  [ -n "$SUDO" ] || die "missing $*: install them (sudo apt install $*) and run again"
+  say "installing $*"
+  $SUDO apt-get update -qq && $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" >/dev/null
+}
+pkgs=()
+command -v curl >/dev/null || pkgs+=(curl)
+[ -e /etc/ssl/certs/ca-certificates.crt ] || pkgs+=(ca-certificates)
+apt_need ${pkgs[@]+"${pkgs[@]}"}
 
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
@@ -164,6 +162,10 @@ elif [ "$FROM_SOURCE" = 0 ]; then
   fi
 fi
 if [ -z "$BINARY" ] && [ "$FROM_SOURCE" = 1 ]; then
+  pkgs=()
+  command -v cc >/dev/null || pkgs+=(build-essential)
+  [ -n "$SRC" ] || command -v git >/dev/null || pkgs+=(git)
+  apt_need ${pkgs[@]+"${pkgs[@]}"}
   if [ -z "$SRC" ]; then
     command -v git >/dev/null || die "git is needed to build from source"
     say "fetching the source ($BRANCH)"
