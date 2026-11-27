@@ -36,13 +36,14 @@ curl -fsSL https://raw.githubusercontent.com/geopsllc/ark-tbw/mainsail/install.s
 ```
 
 It asks for your validator, the node API (your node on `127.0.0.1:4003` when it finds one,
-else the public testnet gateway), the voter share, the memo and the passphrase, then:
+else the public testnet gateway), the voter share, the keep address, the memo and the passphrase, then:
 
 | | |
 |---|---|
 | binary | `/usr/local/bin/ark-tbw` (a release download, checked against its SHA256SUMS; built from source with Rust when no release is published) |
 | config | `~/.ark-tbw/config.toml`, payouts in **shadow mode** (`payout.enabled = false`) |
-| passphrase | `~/.ark-tbw/secret.toml`, chmod 600 (Enter skips it; add it before you go live) |
+| keep address | `share.keep_address` (Enter: the keep stays in the validator wallet) |
+| passphrase | the validator **wallet** passphrase (not the BLS one), in `~/.ark-tbw/secret.toml`, chmod 600 (Enter skips it; add it before you go live) |
 | database | `~/.ark-tbw/ark-tbw.db`, initialised at the current tip |
 | service | the systemd system service, enabled at boot and started |
 
@@ -67,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/geopsllc/ark-tbw/mainsail/install.s
 | `--version TAG` | install a specific release |
 | `--dir DIR` | config folder other than `~/.ark-tbw` |
 | `--no-service` | install and initialise only |
-| `-y` | no questions: defaults, or the values in `TBW_VALIDATOR`, `TBW_API`, `TBW_SHARE`, `TBW_MEMO` |
+| `-y` | no questions: defaults, or the values in `TBW_VALIDATOR`, `TBW_API`, `TBW_SHARE`, `TBW_KEEP`, `TBW_MEMO` |
 
 With `--rootless`, install `curl`, `build-essential` and `git` first if they are missing (the
 script cannot use sudo then).
@@ -97,7 +98,8 @@ ark-tbw finds the other two from `network.api`. Without a node of your own, use 
 gateway `https://testnet.mainsailhq.com/api`.
 
 The passphrase lives in its own file, readable only by you. Mainsail keeps the ARK key scheme,
-so it is the same passphrase as the validator's wallet:
+so it is the same passphrase as the validator's wallet (the one you import into ARK Wallet),
+not the BLS consensus passphrase, which only the node needs:
 
 ```bash
 install -m 600 /dev/null ~/.ark-tbw/secret.toml
