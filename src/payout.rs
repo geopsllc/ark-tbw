@@ -35,7 +35,9 @@ use anyhow::{anyhow, bail, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-pub const REBROADCAST_SECS: i64 = 30;
+/// A transaction still unconfirmed after this long, and no longer in the pool, is sent again.
+/// Generous, because with missed blocks a round can take minutes; the pool keeps it meanwhile.
+pub const REBROADCAST_SECS: i64 = 180;
 pub const STUCK_ATTEMPTS: i64 = 30;
 
 /// Hard cap on recipients per multipayment: what fits in 5,000,000 gas when all exist.
