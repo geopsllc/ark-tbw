@@ -519,9 +519,17 @@ pub fn broadcast_pending(cfg: &Config, api: &mut Api, conn: &mut Connection, sig
         rows.collect::<rusqlite::Result<_>>()?
     };
     let now = db::now();
+    let due: Vec<i64> = slots.iter().filter(|(_, last, _)| force || now - last >= REBROADCAST_SECS).map(|s| s.0).collect();
+    if due.is_empty() {
+        return Ok(());
+    }
+    // A transaction that left the pool because a block included it must not be sent again
+    // (the node would refuse it: nonce already used). The wallet nonce shows that at once,
+    // before the block is confirmed; resolve() settles it once it is.
+    let next_nonce = if force { 0 } else { api.wallet(&signer.address)?.map(|w| w.nonce as i64).unwrap_or(0) };
     let mut batch: Vec<(i64, SignedTx)> = Vec::new();
-    for (nonce, last, _) in &slots {
-        if !force && now - last < REBROADCAST_SECS {
+    for nonce in &due {
+        if *nonce < next_nonce {
             continue;
         }
         let vars = variants_of(conn, *nonce)?;
@@ -575,11 +583,23 @@ pub fn broadcast_pending(cfg: &Config, api: &mut Api, conn: &mut Connection, sig
                     tx.commit()?;
                     warn!("gas price too low for nonce {nonce} ({kind} {msg}): re-signed the same payments at {} gwei", price as f64 / 1e9);
                 }
+                // the nonce was used meanwhile (by this transaction in a block, or by another one):
+                // resolve() finds out which once the block is confirmed
+                Some((_, _, msg)) if sender_nonce(msg).is_some_and(|n| n > *nonce as u64) => {
+                    info!("0x{} (nonce {nonce}) is no longer needed in the pool: the nonce is used, waiting for confirmation", &id[..16])
+                }
                 Some((_, kind, msg)) => warn!("node rejected 0x{} (nonce {nonce}): {kind} {msg}", &id[..16]),
             }
         }
     }
     Ok(())
+}
+
+/// The sender's nonce from a node rejection like "Cannot apply a transaction with nonce 4: the
+/// sender 0x... has nonce 5."
+fn sender_nonce(msg: &str) -> Option<u64> {
+    let rest = &msg[msg.find("has nonce ")? + "has nonce ".len()..];
+    rest.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()
 }
 
 /// Settle pending slots: confirmed, failed (nonce taken by something else) or still waiting.
@@ -729,6 +749,13 @@ pub fn cancel(cfg: &Config, node: &NodeInfo, api: &mut Api, conn: &mut Connectio
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sender_nonce_from_rejection() {
+        let m = "Cannot apply a transaction with nonce 4: the sender 0x7783464d965A1E6a13B19b8222C56C53d32414ad has nonce 5.";
+        assert_eq!(sender_nonce(m), Some(5));
+        assert_eq!(sender_nonce("insufficient balance"), None);
+    }
+
     use super::*;
     use std::path::Path;
 
