@@ -395,6 +395,17 @@ fn cmd_status(cfg: &Config) -> Result<()> {
     if let Some(id) = payout::pending_payout(&conn)? {
         println!("IN PROGRESS  payout #{id}: see  ark-tbw payouts {id}");
     }
+    if let Some(v) = db::get(&conn, "last_check")? {
+        let mut it = v.split(' ');
+        let t = it.next().and_then(|t| t.parse::<i64>().ok()).and_then(|t| chrono::DateTime::from_timestamp(t, 0));
+        let n: u64 = it.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+        let when = t.map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default();
+        if n == 0 {
+            println!("voter check  {when}: all match the node (hourly)");
+        } else {
+            println!("voter check  {when}: repaired {n} wallet(s), see  ark-tbw logs");
+        }
+    }
     let lt = db::get_u64(&conn, "last_payout_time")?.unwrap_or(0);
     println!("last payout  height {lp}, {}", chrono::DateTime::from_timestamp(lt as i64, 0).map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default());
     Ok(())
@@ -634,10 +645,16 @@ fn cmd_run(cli: &Cli, mut cfg: Config) -> Result<()> {
             let caught_up = last + cfg.confirmations + 5 >= tip;
             if caught_up && last_reconcile.map_or(true, |t| t.elapsed() > Duration::from_secs(3600)) {
                 let mut eng = Engine::load(&cfg, &mut api, &mut conn)?;
-                match eng.reconcile()? {
-                    Some(0) => info!("voter check: all {} voters match the node", eng.wallets.values().filter(|w| w.voting).count()),
+                let checked = eng.reconcile()?;
+                match checked {
+                    // logged once after a start; later hourly checks only when they repair something
+                    Some(0) if last_reconcile.is_none() => info!("voter check: all {} voters match the node", eng.wallets.values().filter(|w| w.voting).count()),
+                    Some(0) => {}
                     Some(n) => warn!("voter check: repaired {n} wallet(s)"),
                     None => {}
+                }
+                if let Some(n) = checked {
+                    db::set(&conn, "last_check", &format!("{} {n}", db::now()))?;
                 }
                 last_reconcile = Some(Instant::now());
             }
